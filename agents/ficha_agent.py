@@ -13,6 +13,7 @@ Flujo por mensaje:
 """
 
 import os
+import re
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,10 +35,6 @@ FILLABLE_ATTRIBUTES = {
         "values": ["Laptop", "AIO", "Desktop", "Otro"],
     },
     "marca": {"description": "Fabricante del equipo (ej: HP, Dell, Lenovo, Apple)", "type": "dict"},
-    "linea_producto": {
-        "description": "Línea comercial dentro de la marca (ej: ThinkPad, EliteBook, XPS)",
-        "type": "dict",
-    },
     "nombre_modelo": {"description": "Nombre comercial completo del modelo (opcional)", "type": "free"},
     "procesador_principal": {
         "description": "Modelo completo del procesador (ej: Intel Core i5-1335U, AMD Ryzen 5 7530U)",
@@ -81,7 +78,6 @@ FILLABLE_ATTRIBUTES = {
         "type": "enum",
         "values": ["Wi-Fi 7", "Wi-Fi 6E", "Wi-Fi 6", "Wi-Fi 5", "Wi-Fi 4"],
     },
-    "part_number": {"description": "SKU / part number exacto del fabricante (opcional)", "type": "free"},
 }
 
 # Atributos que se completan automáticamente por complemento (el LLM no los toca)
@@ -95,6 +91,43 @@ COMPLEMENT_ONLY_ATTRIBUTES = {
     "linea_procesador",
     "generacion_procesador",
 }
+
+
+# Extrae la línea canónica del procesador (valores alineados al vocabulario del modelo LGBM)
+_LINEA_RULES = [
+    (r"Core\s+Ultra\s+9",   "Intel Core Ultra 9"),
+    (r"Core\s+Ultra\s+7",   "Intel Core Ultra 7"),
+    (r"Core\s+Ultra\s+5",   "Intel Core Ultra 5"),
+    (r"Core\s+i9",          "Intel Core i9"),
+    (r"Core\s+i7",          "Intel Core i7"),
+    (r"Core\s+i5",          "Intel Core i5"),
+    (r"Core\s+i3",          "Intel Core i3"),
+    (r"\bCeleron\b",        "Intel Celeron"),
+    (r"\bPentium\b",        "Intel Pentium"),
+    (r"\bXeon\b",           "Intel Xeon"),
+    (r"Ryzen\s+AI\s+9",     "AMD Ryzen AI 9"),
+    (r"Ryzen\s+AI\s+7",     "AMD Ryzen AI 7"),
+    (r"Ryzen\s+AI\s+5",     "AMD Ryzen AI 5"),
+    (r"Ryzen\s+9",          "AMD Ryzen 9"),
+    (r"Ryzen\s+7",          "AMD Ryzen 7"),
+    (r"Ryzen\s+5",          "AMD Ryzen 5"),
+    (r"Ryzen\s+3",          "AMD Ryzen 3"),
+    (r"\bAthlon\b",         "AMD Athlon"),
+    (r"Apple\s+M4\s+Max",   "Apple M4 Max"),
+    (r"Apple\s+M4\s+Pro",   "Apple M4 Pro"),
+    (r"Apple\s+M4",         "Apple M4"),
+    (r"Apple\s+M3\s+Pro",   "Apple M3 Pro"),
+    (r"Apple\s+M3",         "Apple M3"),
+    (r"Apple\s+M[12]",      "Apple M-Series"),
+    (r"Apple\s+M\d",        "Apple M-Series"),
+]
+
+
+def _extract_linea_procesador(procesador: str) -> Optional[str]:
+    for pattern, canonical in _LINEA_RULES:
+        if re.search(pattern, procesador, re.IGNORECASE):
+            return canonical
+    return None
 
 
 _SEPARATOR = "§§§"
@@ -153,7 +186,7 @@ Usa siempre el mínimo adecuado. No pongas más de lo necesario.
 2. Para los atributos con valores fijos (SOLO), usa exactamente uno de los valores indicados.
 3. Para atributos de diccionario, sugiere el valor más específico posible.
 4. Máximo UNA pregunta por turno. Prioridad: para qué se usa → tipo de equipo → otros.
-5. NO pidas ni completes: linea_producto, nombre_modelo, part_number, wifi_generacion, pantalla_pulgadas.
+5. NO pidas ni completes: nombre_modelo, wifi_generacion, pantalla_pulgadas.
 6. NO preguntes por marca, sistema operativo ni pantalla a menos que el usuario los mencione.
 7. Si el usuario menciona una marca, modelo o especificaciones concretas, úsalas directamente.
 8. Sé breve y directo. No repitas la ficha en el mensaje. Una o dos oraciones bastan.
@@ -327,6 +360,18 @@ class FichaAgent:
                 })
                 session["ficha"][comp_attr] = comp_val
 
+            if attr == "procesador_principal" and isinstance(normalized_value, str):
+                linea = _extract_linea_procesador(normalized_value)
+                if linea and not session["ficha"].get("linea_procesador"):
+                    complement_updates.append({
+                        "attribute": "linea_procesador",
+                        "value": linea,
+                        "source": "complement",
+                        "triggered_by": "procesador_principal",
+                        "triggered_value": normalized_value,
+                    })
+                    session["ficha"]["linea_procesador"] = linea
+
         yield ("done", {
             "message": msg_text,
             "ficha_updates": ficha_updates,
@@ -399,7 +444,6 @@ class FichaAgent:
             ficha_updates.append(entry)
             session["ficha"][attr] = normalized_value
 
-            # Aplicar complementos al valor normalizado
             comps = self.matcher.get_complements(CATEGORIA, attr, str(normalized_value))
             for comp_attr, comp_val in comps.items():
                 complement_updates.append({
@@ -410,6 +454,18 @@ class FichaAgent:
                     "triggered_value": str(normalized_value),
                 })
                 session["ficha"][comp_attr] = comp_val
+
+            if attr == "procesador_principal" and isinstance(normalized_value, str):
+                linea = _extract_linea_procesador(normalized_value)
+                if linea and not session["ficha"].get("linea_procesador"):
+                    complement_updates.append({
+                        "attribute": "linea_procesador",
+                        "value": linea,
+                        "source": "complement",
+                        "triggered_by": "procesador_principal",
+                        "triggered_value": normalized_value,
+                    })
+                    session["ficha"]["linea_procesador"] = linea
 
         return {
             "message": ai_message,
@@ -445,7 +501,6 @@ class FichaAgent:
         }]
         session["ficha"][attribute] = normalized_value
 
-        # Complementos
         complement_updates = []
         comps = self.matcher.get_complements(CATEGORIA, attribute, str(normalized_value))
         for comp_attr, comp_val in comps.items():
@@ -457,6 +512,18 @@ class FichaAgent:
                 "triggered_value": str(normalized_value),
             })
             session["ficha"][comp_attr] = comp_val
+
+        if attribute == "procesador_principal" and isinstance(normalized_value, str):
+            linea = _extract_linea_procesador(normalized_value)
+            if linea:
+                complement_updates.append({
+                    "attribute": "linea_procesador",
+                    "value": linea,
+                    "source": "complement",
+                    "triggered_by": "procesador_principal",
+                    "triggered_value": str(normalized_value),
+                })
+                session["ficha"]["linea_procesador"] = linea
 
         return {"updates": updates, "complement_updates": complement_updates}
 

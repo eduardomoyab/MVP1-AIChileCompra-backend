@@ -11,6 +11,8 @@ API REST construida con **FastAPI (Python)** que actúa como núcleo inteligente
 | Framework API | FastAPI + Uvicorn |
 | LLM | OpenAI GPT-4o-mini |
 | Búsqueda semántica | FAISS + `paraphrase-multilingual-MiniLM-L12-v2` |
+| Estimación de precios (CA) | PostgreSQL + LLM-driven query refinement |
+| Estimación de precios (mercado) | LightGBM (modelos `.pkl` preentrenados) |
 | Base de datos | PostgreSQL (Railway) |
 | ORM / queries | SQLAlchemy (Core) |
 | Streaming | Server-Sent Events (SSE) |
@@ -77,6 +79,8 @@ sequenceDiagram
     A->>P: SELECT estadísticas FROM PrecioCA WHERE ...
     P-->>A: distribución de precios
     A-->>B: SSE · type: price_update / price_not_found
+    A->>A: LightGBM predict(ficha)
+    A-->>B: SSE · type: lgbm_price_update / lgbm_price_not_found
     A-->>B: data: [DONE]
 ```
 
@@ -98,7 +102,8 @@ graph LR
     end
 
     subgraph services["services/"]
-        PS["price_service.py\nEstimación de precios\nLLM-driven query refinement"]
+        PS["price_service.py\nEstimación precios CA\nLLM-driven query refinement"]
+        LS["lgbm_price_service.py\nEstimación mercado externo\nModelos LightGBM (.pkl)"]
     end
 
     subgraph data["diccionarios/"]
@@ -106,20 +111,35 @@ graph LR
         D2["attribute_complement.csv\nAtributos derivados automáticos"]
     end
 
+    subgraph models["models/lgbm/"]
+        M1["p25/p75/mean_agg_notebooks.pkl"]
+        M2["p25/p75/mean_agg_all_in_one.pkl"]
+    end
+
     EP1 --> AM
     EP2 --> AM
     EP1 --> PS
     EP2 --> PS
+    EP1 --> LS
+    EP2 --> LS
     AM --> GE
     AM --> D1
     AM --> D2
+    LS --> M1
+    LS --> M2
 ```
 
 ### `agents/attribute_matcher.py`
 Carga dos CSVs con el diccionario de atributos y las reglas de complemento. Para cada atributo editable construye un índice FAISS con embeddings de los valores canónicos, permitiendo normalizar valores escritos en lenguaje natural por similitud semántica. El complemento infiere automáticamente atributos derivados: dado un `procesador_principal`, extrae `linea_procesador`, `generacion_procesador`, `nucleos_procesador`, `hilos_procesador` y `frecuencia_turbo_procesador_mhz`.
 
 ### `services/price_service.py`
-Consulta la tabla `PrecioCA` en PostgreSQL con filtros dinámicos sobre los atributos de la ficha. Si la consulta inicial no retorna suficientes registros, invoca al LLM para reformular la query relajando atributos según una jerarquía de especificidad (hasta 6 iteraciones).
+Consulta la tabla `PrecioCA` en PostgreSQL con filtros dinámicos sobre los atributos de la ficha. Si la consulta inicial no retorna suficientes registros, invoca al LLM para reformular la query relajando atributos según una jerarquía de especificidad (hasta 6 iteraciones). Los registros se filtran por `precio_unitario` entre 200 000 y 5 000 000 CLP (sin IVA).
+
+### `services/lgbm_price_service.py`
+Estima el precio de mercado externo usando seis modelos LightGBM preentrenados (P25, P75 y media para `notebooks` y `all_in_one`). Construye un DataFrame de una fila con los atributos de la ficha (incluyendo features temporales: `year`, `month`, `week_of_year`, `days_since_start`, `semester_idx`), convierte columnas numéricas con `pd.to_numeric(..., errors="coerce")` para manejar valores `None` sin errores de dtype, y devuelve P25, P75 y media en CLP. Los modelos se cargan una sola vez al iniciar la aplicación.
+
+### `agents/ficha_agent.py`
+Gestiona el estado de la sesión y la conversación con el LLM. Extrae y estructura los atributos de la ficha técnica a partir del lenguaje natural. Los atributos marcados como `COMPLEMENT_ONLY` (e.g., `linea_procesador`, `generacion_procesador`) son derivados automáticamente por regex desde `procesador_principal` y nunca son solicitados directamente al usuario.
 
 ---
 

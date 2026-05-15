@@ -140,6 +140,7 @@ def _percentile_query(table: str, where_clauses: list, params: dict):
             PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY precio_unitario::numeric)                         AS p75,
             MAX(precio_unitario::numeric)                                                                   AS precio_max,
             ROUND(AVG(precio_unitario::numeric), 0)                                                        AS promedio,
+            ROUND(AVG(precio_unitario_iva::numeric), 0)                                                    AS promedio_iva,
             MIN(precio_unitario_iva::numeric)                                                               AS precio_min_iva,
             PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY precio_unitario_iva::numeric)                     AS p25_iva,
             PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY precio_unitario_iva::numeric)                     AS mediana_iva,
@@ -148,8 +149,8 @@ def _percentile_query(table: str, where_clauses: list, params: dict):
         FROM "{table}"
         WHERE
             LOWER(COALESCE(es_accesorio::text, 'false')) != 'true'
-            AND precio_unitario::numeric > 100000
-            AND precio_unitario::numeric < 100000000
+            AND precio_unitario::numeric > 200000
+            AND precio_unitario::numeric < 5000000
             AND {where_sql}
     """)
 
@@ -169,11 +170,12 @@ def _percentile_query(table: str, where_clauses: list, params: dict):
                     "p75":        int(row[4])  if row[4]  else None,
                     "max":        int(row[5])  if row[5]  else None,
                     "mean":       int(row[6])  if row[6]  else None,
-                    "min_iva":    int(row[7])  if row[7]  else None,
-                    "p25_iva":    int(row[8])  if row[8]  else None,
-                    "median_iva": int(row[9])  if row[9]  else None,
-                    "p75_iva":    int(row[10]) if row[10] else None,
-                    "max_iva":    int(row[11]) if row[11] else None,
+                    "mean_iva":   int(row[7])  if row[7]  else None,
+                    "min_iva":    int(row[8])  if row[8]  else None,
+                    "p25_iva":    int(row[9])  if row[9]  else None,
+                    "median_iva": int(row[10]) if row[10] else None,
+                    "p75_iva":    int(row[11]) if row[11] else None,
+                    "max_iva":    int(row[12]) if row[12] else None,
                 }
             return None  # query ok pero count < 5
         except OperationalError as e:
