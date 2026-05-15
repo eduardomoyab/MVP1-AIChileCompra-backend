@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from agents.attribute_matcher import AttributeMatcher
 from agents.ficha_agent import FichaAgent, FILLABLE_ATTRIBUTES
 from services.price_service import PriceService
+from services.lgbm_price_service import LgbmPriceService
 
 load_dotenv()
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -38,6 +39,7 @@ logging.basicConfig(
 
 matcher = AttributeMatcher()
 price_service = PriceService()
+lgbm_service = LgbmPriceService()
 agent: FichaAgent = None
 
 # ─── API Key ──────────────────────────────────────────────────────────────────
@@ -59,6 +61,7 @@ async def lifespan(app: FastAPI):
     logging.info("Iniciando servidor — calentando índices FAISS...")
     matcher.warm()
     agent = FichaAgent(matcher)
+    lgbm_service._load()
     logging.info("Servidor listo")
     yield
     logging.info("Servidor apagado")
@@ -167,6 +170,16 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
 
+                try:
+                    lgbm = await asyncio.to_thread(lgbm_service.predict, ficha)
+                    if lgbm:
+                        yield sse({"type": "lgbm_price_update", "data": lgbm})
+                    else:
+                        yield sse({"type": "lgbm_price_not_found"})
+                except Exception as e:
+                    logging.warning(f"Error en estimación LGBM: {e}")
+                    yield sse({"type": "lgbm_price_not_found"})
+
             yield "data: [DONE]\n\n"
 
         except Exception as e:
@@ -208,6 +221,16 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
                 except Exception as e:
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
+
+                try:
+                    lgbm = await asyncio.to_thread(lgbm_service.predict, ficha)
+                    if lgbm:
+                        yield sse({"type": "lgbm_price_update", "data": lgbm})
+                    else:
+                        yield sse({"type": "lgbm_price_not_found"})
+                except Exception as e:
+                    logging.warning(f"Error en estimación LGBM: {e}")
+                    yield sse({"type": "lgbm_price_not_found"})
 
             yield "data: [DONE]\n\n"
 
