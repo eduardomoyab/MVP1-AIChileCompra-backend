@@ -199,7 +199,14 @@ flowchart TD
 ```env
 OPENAI_API_KEY=           # API key de OpenAI
 OPENAI_MODEL=gpt-4o-mini  # Modelo LLM
-EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+
+# Proveedor de embeddings: "openai" (~0 MB RAM, llama a la API) o "local" (~500 MB RAM, SentenceTransformer)
+EMBEDDING_PROVIDER=openai
+# Modelo según el proveedor elegido:
+#   openai → text-embedding-3-small
+#   local  → paraphrase-multilingual-MiniLM-L12-v2
+EMBEDDING_MODEL=text-embedding-3-small
+
 DATABASE_URL=             # Connection string PostgreSQL (interno Railway)
 FRONTEND_API_KEY=         # Clave compartida con el frontend para autenticación
 ALLOWED_ORIGINS=          # URL pública del frontend (CORS)
@@ -208,6 +215,8 @@ TEMPERATURE=0.2
 SIMILARITY_THRESHOLD=0.82
 PORT=8000
 ```
+
+> **Cambio de proveedor:** al modificar `EMBEDDING_PROVIDER` o `EMBEDDING_MODEL`, el caché FAISS se elimina automáticamente en el próximo arranque y se reconstruye con el nuevo proveedor. No es necesario limpiar la carpeta manualmente.
 
 ---
 

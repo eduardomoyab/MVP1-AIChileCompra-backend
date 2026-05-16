@@ -22,7 +22,7 @@ import faiss
 import pandas as pd
 from dotenv import load_dotenv
 
-from agents.get_embeddings import get_embedding_model
+from agents.get_embeddings import get_encode_fn, get_provider_id
 
 load_dotenv()
 
@@ -37,6 +37,8 @@ _dict_df: Optional[pd.DataFrame] = None
 _comp_df: Optional[pd.DataFrame] = None
 # (categoria, atributo) -> {"index": faiss.Index, "values": [str]}
 _indices: Dict[Tuple[str, str], Dict] = {}
+
+_PROVIDER_FILE = os.path.join(CACHE_DIR, "_provider.txt")
 
 
 def _load_csvs() -> None:
@@ -58,6 +60,26 @@ def _cache_path(categoria: str, atributo: str) -> str:
     return os.path.join(CACHE_DIR, f"{safe}.pkl")
 
 
+def _invalidate_cache_if_provider_changed() -> None:
+    import shutil
+    current = get_provider_id()
+    if os.path.exists(_PROVIDER_FILE):
+        with open(_PROVIDER_FILE, "r", encoding="utf-8") as f:
+            cached = f.read().strip()
+        if cached == current:
+            return
+        logging.info(f"[FAISS] Proveedor cambió ({cached} → {current}). Limpiando caché...")
+        for fname in os.listdir(CACHE_DIR):
+            fpath = os.path.join(CACHE_DIR, fname)
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+        _indices.clear()
+        logging.info("[FAISS] Caché eliminado")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(_PROVIDER_FILE, "w", encoding="utf-8") as f:
+        f.write(current)
+
+
 def _build_index(categoria: str, atributo: str) -> Optional[Dict]:
     _load_csvs()
     mask = (_dict_df["categoria"] == categoria) & (_dict_df["atributo"] == atributo)
@@ -65,9 +87,8 @@ def _build_index(categoria: str, atributo: str) -> Optional[Dict]:
     if not valores:
         return None
 
-    model = get_embedding_model()
-    embeddings = model.encode(valores, normalize_embeddings=True, show_progress_bar=False)
-    embeddings = np.array(embeddings, dtype=np.float32)
+    encode = get_encode_fn()
+    embeddings = encode(valores)
 
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
@@ -115,6 +136,7 @@ class AttributeMatcher:
 
     def warm(self) -> None:
         _load_csvs()
+        _invalidate_cache_if_provider_changed()
         grupos = _dict_df.groupby(["categoria", "atributo"])
         total = 0
         for (cat, atr), _ in grupos:
@@ -146,9 +168,8 @@ class AttributeMatcher:
         if data is None:
             return valor, 0.0, []
 
-        model = get_embedding_model()
-        q_emb = model.encode([valor], normalize_embeddings=True, show_progress_bar=False)
-        q_emb = np.array(q_emb, dtype=np.float32)
+        encode = get_encode_fn()
+        q_emb = encode([valor])
 
         actual_k = min(k, len(data["values"]))
         scores, idxs = data["index"].search(q_emb, actual_k)
