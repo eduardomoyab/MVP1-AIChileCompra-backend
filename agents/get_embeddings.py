@@ -40,9 +40,13 @@ def _make_openai_encoder() -> Callable:
     logging.info(f"[Embeddings] Usando OpenAI: {EMBEDDING_MODEL}")
 
     def encode(texts: list) -> np.ndarray:
-        response = client.embeddings.create(input=texts, model=EMBEDDING_MODEL)
-        vectors = [item.embedding for item in response.data]
-        arr = np.array(vectors, dtype=np.float32)
+        batch_size = 512
+        all_vectors = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            response = client.embeddings.create(input=batch, model=EMBEDDING_MODEL)
+            all_vectors.extend(item.embedding for item in response.data)
+        arr = np.array(all_vectors, dtype=np.float32)
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1.0, norms)
         return arr / norms
