@@ -17,6 +17,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+import httpx
+
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -58,11 +60,10 @@ async def require_api_key(x_api_key: Optional[str] = Depends(_api_key_header)):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global agent
-    logging.info("Iniciando servidor — calentando índices FAISS...")
-    matcher.warm()
     agent = FichaAgent(matcher)
     lgbm_service._load()
-    logging.info("Servidor listo")
+    logging.info("Servidor listo — construyendo índices FAISS en background...")
+    asyncio.create_task(asyncio.to_thread(matcher.warm))
     yield
     logging.info("Servidor apagado")
 
@@ -125,6 +126,22 @@ async def get_schema():
     return {"categoria": "Computadores", "attributes": schema}
 
 
+# ─── Dropdowns ────────────────────────────────────────────────────────────────
+
+# Atributos que se resuelven desde el diccionario FAISS (no están en PrecioCA)
+_DICT_DROPDOWN_ATTRS = [
+    "gpu_dedicada_nombre",
+    "total_vram_gpu_gb",
+]
+
+@app.get("/api/dropdowns")
+async def get_dropdowns():
+    db_values = await asyncio.to_thread(price_service.get_dropdown_values)
+    for attr in _DICT_DROPDOWN_ATTRS:
+        db_values[attr] = matcher.get_valid_values("Computadores", attr)
+    return db_values
+
+
 # ─── Chat (SSE) ───────────────────────────────────────────────────────────────
 
 @app.post("/api/chat/{session_id}")
@@ -170,16 +187,6 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
 
-                try:
-                    lgbm = await asyncio.to_thread(lgbm_service.predict, ficha)
-                    if lgbm:
-                        yield sse({"type": "lgbm_price_update", "data": lgbm})
-                    else:
-                        yield sse({"type": "lgbm_price_not_found"})
-                except Exception as e:
-                    logging.warning(f"Error en estimación LGBM: {e}")
-                    yield sse({"type": "lgbm_price_not_found"})
-
             yield "data: [DONE]\n\n"
 
         except Exception as e:
@@ -222,16 +229,6 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
 
-                try:
-                    lgbm = await asyncio.to_thread(lgbm_service.predict, ficha)
-                    if lgbm:
-                        yield sse({"type": "lgbm_price_update", "data": lgbm})
-                    else:
-                        yield sse({"type": "lgbm_price_not_found"})
-                except Exception as e:
-                    logging.warning(f"Error en estimación LGBM: {e}")
-                    yield sse({"type": "lgbm_price_not_found"})
-
             yield "data: [DONE]\n\n"
 
         except Exception as e:
@@ -240,6 +237,66 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+# ─── Offers ───────────────────────────────────────────────────────────────────
+
+_CA_API_BASE = "https://servicios-compra-agil.mercadopublico.cl/v1/compra-agil/solicitud"
+_CA_PO_BASE  = "https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx"
+
+@app.get("/api/offers/{session_id}")
+async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)):
+    ficha = agent.get_ficha(session_id)
+    if not ficha.get("tipo_equipo"):
+        return {"offers": []}
+
+    rows = await asyncio.to_thread(price_service.get_offer_rows, ficha, 30)
+    if not rows:
+        return {"offers": []}
+
+    token = await asyncio.to_thread(price_service.get_token)
+    unique_reqs = list(dict.fromkeys(r["codigo_requerimiento"] for r in rows if r["codigo_requerimiento"]))
+    oc_map: dict = {req: [] for req in unique_reqs}
+
+    if token and unique_reqs:
+        sem = asyncio.Semaphore(5)
+
+        async def fetch_oc(req_code: str):
+            async with sem:
+                try:
+                    async with httpx.AsyncClient(timeout=8.0) as client:
+                        resp = await client.get(
+                            f"{_CA_API_BASE}/{req_code}?size=20&page=0",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                    if resp.status_code == 200:
+                        ofertas = (resp.json().get("payload") or {}).get("ofertas") or []
+                        codes = [
+                            oc["code"]
+                            for o in ofertas
+                            for oc in (o.get("ordenesCompra") or [])
+                            if oc.get("code")
+                        ]
+                        return req_code, codes
+                except Exception as e:
+                    logging.warning(f"[fetch_oc] {req_code}: {e}")
+            return req_code, []
+
+        results = await asyncio.gather(*[fetch_oc(r) for r in unique_reqs])
+        oc_map = dict(results)
+
+    offers = [
+        {
+            **row,
+            "oc_codes": oc_map.get(row["codigo_requerimiento"], []),
+            "oc_urls": [
+                f"{_CA_PO_BASE}?CodigoOC={c}"
+                for c in oc_map.get(row["codigo_requerimiento"], [])
+            ],
+        }
+        for row in rows
+    ]
+    return {"offers": offers}
 
 
 # ─── Reset ────────────────────────────────────────────────────────────────────

@@ -80,6 +80,15 @@ FILLABLE_ATTRIBUTES = {
     },
 }
 
+# Campos a limpiar cuando el atributo disparador recibe un valor multi-selección
+_MULTI_VALUE_CLEARS: Dict[str, List[str]] = {
+    "procesador_principal": [
+        "linea_procesador", "generacion_procesador",
+        "nucleos_procesador", "hilos_procesador", "frecuencia_turbo_procesador_mhz",
+    ],
+    "gpu_dedicada_nombre": ["total_vram_gpu_gb", "tecnologia_gpu_principal"],
+}
+
 # Atributos que se completan automáticamente por complemento (el LLM no los toca)
 COMPLEMENT_ONLY_ATTRIBUTES = {
     "nucleos_procesador",
@@ -88,7 +97,6 @@ COMPLEMENT_ONLY_ATTRIBUTES = {
     "frecuencia_ram_mhz",
     "total_vram_gpu_gb",
     "tecnologia_gpu_principal",
-    "linea_procesador",
     "generacion_procesador",
 }
 
@@ -159,14 +167,48 @@ Tu misión es entender qué necesita el usuario y completar la ficha con las esp
 
 {attrs_str}
 
-**NUNCA incluyas en ficha_updates**: nucleos_procesador, hilos_procesador, frecuencia_turbo_procesador_mhz, frecuencia_ram_mhz, total_vram_gpu_gb, linea_procesador, generacion_procesador, tecnologia_gpu_principal. Esos se completan solos.
+**NUNCA incluyas en ficha_updates**: nucleos_procesador, hilos_procesador, frecuencia_turbo_procesador_mhz, frecuencia_ram_mhz, total_vram_gpu_gb, generacion_procesador, tecnologia_gpu_principal. Esos se completan solos.
 
-## REGLA PRINCIPAL: PARA QUÉ SE USA EL EQUIPO
+**REGLA PROCESADOR — distinción crítica**:
+- `procesador_principal`: SOLO cuando el usuario indica un modelo EXACTO con número (ej: "i5-1335U", "Ryzen 7 7745HX"). **NUNCA inventes ni sugeras un modelo específico por tu cuenta.**
+- `linea_procesador`: cuando el usuario menciona la familia sin número de modelo (ej: "Intel Core i5", "AMD Ryzen 7", "un i5"). Úsalo siempre que no haya un número de modelo explícito del usuario.
 
-**Antes de sugerir especificaciones, debes saber para qué se va a usar el equipo.**
-- Si el usuario no lo mencionó, tu única pregunta en ese turno debe ser para qué lo van a usar.
-- Sin conocer el uso, NO completes RAM, almacenamiento, procesador ni GPU. Solo puedes inferir tipo_equipo si es obvio.
-- Una vez que sepas el uso, llena todos los atributos que puedas.
+**Regla de oro**: si el número de modelo NO aparece textualmente en el mensaje del usuario, usa `linea_procesador` y deja `procesador_principal` vacío, A MENOS QUE el usuario te pida explícitamente que elijas o sugieras un modelo (frases como "tú elige uno", "sugiéreme uno", "el que sea mejor", "ponle el que corresponda").
+
+Ejemplos:
+- "ponle un intel core i5" → `{{"linea_procesador": "Intel Core i5"}}`  ✓
+- "intel core i5, ninguno en específico" → `{{"linea_procesador": "Intel Core i5"}}`  ✓
+- "quiero un i5-1335U" → `{{"procesador_principal": "Intel Core i5-1335U"}}`  ✓
+- "ponle un buen procesador i5" → `{{"linea_procesador": "Intel Core i5"}}`  ✓  (no inventar modelo)
+- "Intel Core i5-6500" en ficha_updates sin que el usuario lo dijera → ✗ PROHIBIDO
+
+## REGLA 0: RESPETO A DECISIONES EXPLÍCITAS DEL USUARIO
+
+Si el usuario indica explícitamente que quiere algo concreto (una marca, un procesador, una cantidad de RAM, etc.), **acéptalo siempre sin cuestionar ni intentar cambiar su decisión**, aunque no coincida con tu recomendación. Tu rol es asistir, no decidir. Puedes mencionar brevemente una alternativa si es muy relevante, pero en ese mismo turno debes igualmente registrar lo que el usuario pidió.
+
+Ejemplos de decisiones explícitas a respetar:
+- "quiero 32 GB de RAM" → registra 32 GB aunque el uso no lo justifique
+- "prefiero HP" → registra marca HP
+- "lo quiero con GPU dedicada" → registra tiene_gpu_dedicada: true
+
+## REGLA PRINCIPAL: EXPLORAR EL PROPÓSITO ANTES DE ESPECIFICAR
+
+**Antes de sugerir especificaciones técnicas, debes conocer bien para qué se usará el equipo.**
+
+- Si el usuario no mencionó el uso, pregunta exclusivamente por eso en ese turno.
+- Sin conocer el uso, NO completes RAM, almacenamiento, procesador ni GPU. Solo puedes inferir tipo_equipo si es muy obvio.
+- Una vez que el usuario dé un uso inicial, **sigue haciendo preguntas de seguimiento** para afinar el perfil funcional. No llenes la ficha hasta tener claridad suficiente.
+
+**Cuándo dejar de preguntar y llenar la ficha** (basta con UNA de estas condiciones):
+1. Tienes suficiente contexto para determinar con confianza las especificaciones adecuadas (conoces el uso, la intensidad y los programas principales).
+2. El usuario indica explícitamente que ya entregó suficiente información (frases como "con eso basta", "ya es suficiente", "listo", "procede", "con eso nomás").
+
+**Preguntas de seguimiento útiles según el uso declarado:**
+- Oficina: ¿usa programas específicos además de Office? ¿maneja bases de datos, macros complejas o muchos archivos abiertos?
+- Programación: ¿qué lenguajes/tecnologías? ¿corre servidores locales o contenedores?
+- Diseño: ¿edita fotos, video o 3D? ¿qué programas usa (Photoshop, Premiere, Blender)?
+- Análisis de datos: ¿trabaja con modelos de ML, datasets grandes o solo Excel/Power BI?
+- Educación/terreno: ¿lo usará en campo sin enchufe constante? ¿necesita ser portátil y liviano?
 
 ## ESPECIFICACIONES MÍNIMAS SEGÚN USO
 
@@ -182,13 +224,13 @@ Usa siempre el mínimo adecuado. No pongas más de lo necesario.
 
 ## REGLAS DE COMPORTAMIENTO
 
-1. Conocido el uso, llena TODOS los atributos que puedas determinar con confianza.
+1. Conocido el uso con suficiente detalle, llena TODOS los atributos que puedas determinar con confianza.
 2. Para los atributos con valores fijos (SOLO), usa exactamente uno de los valores indicados.
 3. Para atributos de diccionario, sugiere el valor más específico posible.
-4. Máximo UNA pregunta por turno. Prioridad: para qué se usa → tipo de equipo → otros.
+4. Máximo UNA pregunta por turno. Mientras no tengas perfil funcional claro, prioriza preguntas de uso.
 5. NO pidas ni completes: nombre_modelo, wifi_generacion, pantalla_pulgadas.
 6. NO preguntes por marca, sistema operativo ni pantalla a menos que el usuario los mencione.
-7. Si el usuario menciona una marca, modelo o especificaciones concretas, úsalas directamente.
+7. Si el usuario menciona una marca, modelo o especificaciones concretas, úsalas directamente (ver Regla 0).
 8. Sé breve y directo. No repitas la ficha en el mensaje. Una o dos oraciones bastan.
 9. Escribe en español de Chile, con un tono formal pero natural. Sin tecnicismos innecesarios.
 
@@ -207,13 +249,23 @@ Responde SIEMPRE con este formato exacto, nada más:
 
 ## EJEMPLOS
 
-Usuario: "quiero un equipo para la oficina, que use excel, ppt, word"
-Para trabajo de oficina con Office, 8 GB de RAM y 256 GB de disco son suficientes sin gastar de más.
+Usuario: "quiero un equipo para la oficina"
+Entendido. Para afinar las especificaciones, ¿qué programas usarán principalmente? ¿Solo Office básico o también Excel con macros, bases de datos u otras aplicaciones exigentes?
 {_SEPARATOR}
-{{"ficha_updates": {{"tipo_equipo": "Laptop", "procesador_principal": "Intel Core i5-1335U", "total_ram_gb": 8, "tecnologia_ram": "DDR4", "total_almacenamiento_gb": 256, "tecnologia_disco_principal": "NVMe SSD", "tipo_configuracion_discos": "solo SSD", "tiene_gpu_dedicada": false, "sistema_operativo": "Microsoft Windows 11 Home"}}, "questions": []}}
+{{"ficha_updates": {{"tipo_equipo": "Laptop"}}, "questions": ["¿Qué programas usarán principalmente? ¿Solo Office básico o también Excel con macros, bases de datos u otras aplicaciones más exigentes?"]}}
+
+Usuario: "solo Office, Word y Excel básico, correo, nada más exigente"
+Con ese uso, 8 GB de RAM y 256 GB de almacenamiento son suficientes.
+{_SEPARATOR}
+{{"ficha_updates": {{"procesador_principal": "Intel Core i5-1335U", "total_ram_gb": 8, "tecnologia_ram": "DDR4", "total_almacenamiento_gb": 256, "tecnologia_disco_principal": "NVMe SSD", "tipo_configuracion_discos": "solo SSD", "tiene_gpu_dedicada": false, "sistema_operativo": "Microsoft Windows 11 Home"}}, "questions": []}}
+
+Usuario: "quiero 32 GB de RAM para trabajo de oficina básico"
+Registrado con 32 GB según tu indicación.
+{_SEPARATOR}
+{{"ficha_updates": {{"total_ram_gb": 32}}, "questions": []}}
 
 Usuario: "necesito un equipo"
-Para recomendarte las especificaciones correctas, necesito saber para qué lo van a usar.
+Para recomendarte las especificaciones correctas, ¿para qué lo van a usar?
 {_SEPARATOR}
 {{"ficha_updates": {{}}, "questions": ["¿Para qué se usará el equipo? (por ejemplo: trabajo de oficina, programación, diseño, edición de video)"]}}"""
 
@@ -484,9 +536,15 @@ class FichaAgent:
         """
         session = _get_session(session_id)
 
-        # Intentar normalizar si el atributo está en el diccionario
-        if attribute not in COMPLEMENT_ONLY_ATTRIBUTES and isinstance(value, str) and value.strip():
-            normalized_value, score, _ = self._normalize(attribute, value)
+        # Normalizar según tipo de valor
+        if attribute not in COMPLEMENT_ONLY_ATTRIBUTES:
+            if isinstance(value, list) or (isinstance(value, dict) and ("min" in value or "max" in value)):
+                normalized_value, score, _ = self._normalize(attribute, value)
+            elif isinstance(value, str) and value.strip():
+                normalized_value, score, _ = self._normalize(attribute, value)
+            else:
+                normalized_value = value
+                score = 1.0
         else:
             normalized_value = value
             score = 1.0
@@ -525,6 +583,22 @@ class FichaAgent:
                 })
                 session["ficha"]["linea_procesador"] = linea
 
+        # Limpiar complementos cuando se borra o se asignan múltiples valores
+        should_clear = (
+            normalized_value is None or isinstance(normalized_value, list)
+        ) and attribute in _MULTI_VALUE_CLEARS
+        if should_clear:
+            for clr_attr in _MULTI_VALUE_CLEARS[attribute]:
+                if session["ficha"].get(clr_attr) is not None:
+                    session["ficha"][clr_attr] = None
+                    complement_updates.append({
+                        "attribute": clr_attr,
+                        "value": None,
+                        "source": "complement",
+                        "triggered_by": attribute,
+                        "triggered_value": None,
+                    })
+
         return {"updates": updates, "complement_updates": complement_updates}
 
     def get_ficha(self, session_id: str) -> Dict[str, Any]:
@@ -539,6 +613,23 @@ class FichaAgent:
     def _normalize(self, attribute: str, value: Any) -> Tuple[Any, float, list]:
         meta = FILLABLE_ATTRIBUTES.get(attribute, {})
         attr_type = meta.get("type", "free")
+
+        # Lista de valores → normalizar cada elemento individualmente
+        if isinstance(value, list):
+            normalized = []
+            min_score = 1.0
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    norm, score, _ = self._normalize(attribute, item)
+                    normalized.append(norm)
+                    min_score = min(min_score, score)
+                else:
+                    normalized.append(item)
+            return normalized, min_score, []
+
+        # Rango (dict con min/max) → pasar tal cual sin normalizar
+        if isinstance(value, dict) and ("min" in value or "max" in value):
+            return value, 1.0, []
 
         # Para enums y booleanos no usamos FAISS
         if attr_type in ("enum", "boolean") or not isinstance(value, str):
