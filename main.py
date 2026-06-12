@@ -62,8 +62,9 @@ async def lifespan(app: FastAPI):
     global agent
     agent = FichaAgent(matcher)
     lgbm_service._load()
-    logging.info("Servidor listo — construyendo índices FAISS en background...")
+    logging.info("Servidor listo — construyendo índices FAISS y dropdowns en background...")
     asyncio.create_task(asyncio.to_thread(matcher.warm))
+    asyncio.create_task(asyncio.to_thread(price_service.warmup_dropdowns))
     yield
     logging.info("Servidor apagado")
 

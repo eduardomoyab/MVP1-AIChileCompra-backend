@@ -23,6 +23,7 @@ load_dotenv()
 _DB_URL = os.getenv("DATABASE_URL")
 _engine = None
 _TABLE_NAME: Optional[str] = None
+_dropdown_cache: Optional[Dict] = None
 
 _DB_MAX_RETRIES = 3
 _DB_RETRY_DELAY = 2
@@ -295,12 +296,16 @@ class PriceService:
         return None
 
     def get_dropdown_values(self) -> Dict[str, List]:
-        """Retorna valores distintos de PrecioCA para usar en dropdowns del frontend."""
+        global _dropdown_cache
+        if _dropdown_cache is not None:
+            return _dropdown_cache
+        _dropdown_cache = self._fetch_dropdown_values()
+        return _dropdown_cache
+
+    def _fetch_dropdown_values(self) -> Dict[str, List]:
         table = _resolve_table_name()
         if not table:
             return {}
-
-        result = {}
         engine = _get_engine()
         if not engine:
             return {}
@@ -313,6 +318,7 @@ class PriceService:
             except Exception:
                 return float("inf")
 
+        result = {}
         for field, col in DROPDOWN_DB_COLS:
             try:
                 with engine.connect() as conn:
@@ -333,7 +339,12 @@ class PriceService:
                 logging.warning(f"[Dropdowns] Error en columna '{col}': {e}")
                 result[field] = []
 
+        logging.info(f"[Dropdowns] Caché cargada: {', '.join(f'{k}={len(v)}' for k, v in result.items())}")
         return result
+
+    def warmup_dropdowns(self) -> None:
+        global _dropdown_cache
+        _dropdown_cache = self._fetch_dropdown_values()
 
     def get_token(self) -> Optional[str]:
         engine = _get_engine()
