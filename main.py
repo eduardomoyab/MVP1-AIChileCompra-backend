@@ -303,7 +303,7 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
         async def fetch_oc(req_code: str):
             async with sem:
                 try:
-                    async with httpx.AsyncClient(timeout=8.0) as client:
+                    async with httpx.AsyncClient(timeout=8.0, verify=False) as client:
                         resp = await client.get(
                             f"{_CA_API_BASE}/{req_code}?size=20&page=0",
                             headers={"Authorization": f"Bearer {token}"},
