@@ -242,8 +242,9 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
 
 # ─── Offers ───────────────────────────────────────────────────────────────────
 
-_CA_API_BASE = "https://servicios-compra-agil.mercadopublico.cl/v1/compra-agil/solicitud"
-_CA_PO_BASE  = "https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx"
+_CA_API_BASE      = "https://servicios-compra-agil.mercadopublico.cl/v1/compra-agil/solicitud"
+_CA_PO_BASE       = "https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx"
+_CA_BUSCADOR_BASE = "https://buscador.mercadopublico.cl/ficha"
 
 @app.get("/api/offers/{session_id}")
 async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)):
@@ -251,13 +252,18 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
     if not ficha.get("tipo_equipo"):
         return {"offers": []}
 
-    rows = await asyncio.to_thread(price_service.get_offer_rows, ficha, 30)
+    price_data = await asyncio.to_thread(price_service.estimate, ficha)
+    p25 = price_data.get("p25") if price_data else None
+    p75 = price_data.get("p75") if price_data else None
+
+    rows = await asyncio.to_thread(price_service.get_offer_rows, ficha, 30, p25, p75)
     if not rows:
         return {"offers": []}
 
     token = await asyncio.to_thread(price_service.get_token)
     unique_reqs = list(dict.fromkeys(r["codigo_requerimiento"] for r in rows if r["codigo_requerimiento"]))
     oc_map: dict = {req: [] for req in unique_reqs}
+    ca_map: dict = {req: False for req in unique_reqs}
 
     if token and unique_reqs:
         sem = asyncio.Semaphore(5)
@@ -278,22 +284,22 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
                             for oc in (o.get("ordenesCompra") or [])
                             if oc.get("code")
                         ]
-                        return req_code, codes
+                        return req_code, codes, True
                 except Exception as e:
                     logging.warning(f"[fetch_oc] {req_code}: {e}")
-            return req_code, []
+            return req_code, [], False
 
         results = await asyncio.gather(*[fetch_oc(r) for r in unique_reqs])
-        oc_map = dict(results)
+        oc_map = {req: codes for req, codes, _ in results}
+        ca_map = {req: ok   for req, _,     ok in results}
 
     offers = [
         {
             **row,
-            "oc_codes": oc_map.get(row["codigo_requerimiento"], []),
-            "oc_urls": [
-                f"{_CA_PO_BASE}?CodigoOC={c}"
-                for c in oc_map.get(row["codigo_requerimiento"], [])
-            ],
+            "oc_codes":    oc_map.get(row["codigo_requerimiento"], []),
+            "oc_urls":     [f"{_CA_PO_BASE}?CodigoOC={c}" for c in oc_map.get(row["codigo_requerimiento"], [])],
+            "ca_url":      f"{_CA_BUSCADOR_BASE}?code={row['codigo_requerimiento']}",
+            "ca_available": ca_map.get(row["codigo_requerimiento"], False),
         }
         for row in rows
     ]

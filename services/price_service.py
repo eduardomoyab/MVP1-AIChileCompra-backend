@@ -363,7 +363,13 @@ class PriceService:
             logging.warning(f"[token_store] No se pudo leer el token: {e}")
             return None
 
-    def get_offer_rows(self, ficha: Dict[str, Any], limit: int = 30) -> List[Dict]:
+    def get_offer_rows(
+        self,
+        ficha: Dict[str, Any],
+        limit: int = 30,
+        price_min: Optional[int] = None,
+        price_max: Optional[int] = None,
+    ) -> List[Dict]:
         table = _resolve_table_name()
         if not table or not ficha.get("tipo_equipo"):
             return []
@@ -375,6 +381,12 @@ class PriceService:
         where_clauses, params = _build_where(current_attrs)
         if not where_clauses:
             return []
+        if price_min is not None:
+            where_clauses.append("precio_unitario::numeric >= :iqr_min")
+            params["iqr_min"] = price_min
+        if price_max is not None:
+            where_clauses.append("precio_unitario::numeric <= :iqr_max")
+            params["iqr_max"] = price_max
         where_sql = " AND ".join(where_clauses)
         sql = text(f"""
             SELECT
