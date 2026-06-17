@@ -30,6 +30,7 @@ from agents.attribute_matcher import AttributeMatcher
 from agents.ficha_agent import FichaAgent, FILLABLE_ATTRIBUTES
 from services.price_service import PriceService
 from services.lgbm_price_service import LgbmPriceService
+from services.guardrail_service import GuardrailService
 
 load_dotenv()
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -42,7 +43,12 @@ logging.basicConfig(
 matcher = AttributeMatcher()
 price_service = PriceService()
 lgbm_service = LgbmPriceService()
+guardrail = GuardrailService()
 agent: FichaAgent = None
+
+# Historial liviano por sesión para el guardrail (máx 20 mensajes por sesión)
+_session_histories: dict[str, list[dict]] = {}
+_HISTORY_MAX = 20
 
 # ─── API Key ──────────────────────────────────────────────────────────────────
 
@@ -156,16 +162,42 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
 
     async def event_gen():
         try:
+            # ── Guardrail: validar mensaje antes de procesarlo ──────────────
+            history = _session_histories.get(session_id, [])
+            allowed, block_reason, clean_message = await guardrail.check(content, history)
+
+            if not allowed:
+                logging.info(f"[guardrail] Bloqueado session={session_id}: {block_reason}")
+                yield sse({"type": "blocked", "message": block_reason})
+                yield "data: [DONE]\n\n"
+                return
+
+            # Usar la versión limpia si el guardrail extrajo solo la parte válida
+            effective_content = clean_message if clean_message else content
+            if clean_message:
+                logging.info(f"[guardrail] Mensaje parcial limpiado session={session_id}: {block_reason}")
+
+            # Registrar mensaje original del usuario en el historial
+            history.append({"role": "user", "content": content})
+            if len(history) > _HISTORY_MAX:
+                history = history[-_HISTORY_MAX:]
+            _session_histories[session_id] = history
+
             yield sse({"type": "thinking"})
 
             result = {}
-            async for event_type, event_data in agent.stream_process_message(session_id, content):
+            async for event_type, event_data in agent.stream_process_message(session_id, effective_content):
                 if event_type == "chunk":
                     yield sse({"type": "assistant_chunk", "delta": event_data})
                 elif event_type == "done":
                     result = event_data
 
             yield sse({"type": "assistant_done"})
+
+            # Registrar respuesta del asistente para contexto futuro del guardrail
+            if result.get("message"):
+                history.append({"role": "assistant", "content": result["message"][:400]})
+                _session_histories[session_id] = history[-_HISTORY_MAX:]
 
             if result.get("ficha_updates"):
                 yield sse({"type": "ficha_update", "updates": result["ficha_updates"]})
@@ -311,6 +343,7 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
 @app.post("/api/reset/{session_id}")
 async def reset_endpoint(session_id: str, _: str = Depends(require_api_key)):
     agent.reset_session(session_id)
+    _session_histories.pop(session_id, None)
     return {"type": "reset_ok"}
 
 
