@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _DB_URL = os.getenv("DATABASE_URL")
+_BROAD_SEARCH_THRESHOLD = int(os.getenv("BROAD_SEARCH_THRESHOLD", "1000"))
 _engine = None
 _TABLE_NAME: Optional[str] = None
 _dropdown_cache: Optional[Dict] = None
@@ -147,19 +148,20 @@ def _percentile_query(table: str, where_clauses: list, params: dict):
             logging.info(f"[PrecioCA] {json.dumps(params, ensure_ascii=False)} → {count} registros")
             if count >= 1:
                 return {
-                    "count":      int(row[0]),
-                    "min":        int(row[1])  if row[1]  else None,
-                    "p25":        int(row[2])  if row[2]  else None,
-                    "median":     int(row[3])  if row[3]  else None,
-                    "p75":        int(row[4])  if row[4]  else None,
-                    "max":        int(row[5])  if row[5]  else None,
-                    "mean":       int(row[6])  if row[6]  else None,
-                    "mean_iva":   int(row[7])  if row[7]  else None,
-                    "min_iva":    int(row[8])  if row[8]  else None,
-                    "p25_iva":    int(row[9])  if row[9]  else None,
-                    "median_iva": int(row[10]) if row[10] else None,
-                    "p75_iva":    int(row[11]) if row[11] else None,
-                    "max_iva":    int(row[12]) if row[12] else None,
+                    "count":        int(row[0]),
+                    "min":          int(row[1])  if row[1]  else None,
+                    "p25":          int(row[2])  if row[2]  else None,
+                    "median":       int(row[3])  if row[3]  else None,
+                    "p75":          int(row[4])  if row[4]  else None,
+                    "max":          int(row[5])  if row[5]  else None,
+                    "mean":         int(row[6])  if row[6]  else None,
+                    "mean_iva":     int(row[7])  if row[7]  else None,
+                    "min_iva":      int(row[8])  if row[8]  else None,
+                    "p25_iva":      int(row[9])  if row[9]  else None,
+                    "median_iva":   int(row[10]) if row[10] else None,
+                    "p75_iva":      int(row[11]) if row[11] else None,
+                    "max_iva":      int(row[12]) if row[12] else None,
+                    "broad_warning": count >= _BROAD_SEARCH_THRESHOLD,
                 }
             return None
         except OperationalError as e:
