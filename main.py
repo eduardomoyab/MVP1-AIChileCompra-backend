@@ -294,13 +294,14 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
 
     token = await asyncio.to_thread(price_service.get_token)
     unique_reqs = list(dict.fromkeys(r["codigo_requerimiento"] for r in rows if r["codigo_requerimiento"]))
-    oc_map: dict = {req: [] for req in unique_reqs}
-    ca_map: dict = {req: False for req in unique_reqs}
+    # req_code -> {oferta_id -> {"oc_codes": [...], "razon_social": str|None}}
+    req_oferta_map: dict[str, dict[int, dict]] = {req: {} for req in unique_reqs}
+    ca_map: dict[str, bool] = {req: False for req in unique_reqs}
 
     if token and unique_reqs:
         sem = asyncio.Semaphore(5)
 
-        async def fetch_oc(req_code: str):
+        async def fetch_req(req_code: str):
             async with sem:
                 try:
                     async with httpx.AsyncClient(timeout=8.0, verify=False) as client:
@@ -310,31 +311,43 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
                         )
                     if resp.status_code == 200:
                         ofertas = (resp.json().get("payload") or {}).get("ofertas") or []
-                        codes = [
-                            oc["code"]
-                            for o in ofertas
-                            for oc in (o.get("ordenesCompra") or [])
-                            if oc.get("code")
-                        ]
-                        return req_code, codes, True
+                        oferta_data: dict[int, dict] = {}
+                        for o in ofertas:
+                            oid = o.get("id")
+                            if oid is None:
+                                continue
+                            oc_codes = list(dict.fromkeys(
+                                oc["code"]
+                                for oc in (o.get("ordenesCompra") or [])
+                                if oc.get("code")
+                            ))
+                            oferta_data[int(oid)] = {
+                                "oc_codes":    oc_codes,
+                                "razon_social": o.get("razonSocial"),
+                            }
+                        return req_code, oferta_data, True
                 except Exception as e:
                     logging.warning(f"[fetch_oc] {req_code}: {e}")
-            return req_code, [], False
+            return req_code, {}, False
 
-        results = await asyncio.gather(*[fetch_oc(r) for r in unique_reqs])
-        oc_map = {req: codes for req, codes, _ in results}
-        ca_map = {req: ok   for req, _,     ok in results}
+        results = await asyncio.gather(*[fetch_req(r) for r in unique_reqs])
+        req_oferta_map = {req: data for req, data, _ in results}
+        ca_map = {req: ok for req, _, ok in results}
 
-    offers = [
-        {
+    offers = []
+    for row in rows:
+        req = row["codigo_requerimiento"]
+        oferta_id = row.get("id_oferta_aquiles")
+        oferta_info = req_oferta_map.get(req, {}).get(oferta_id, {}) if oferta_id else {}
+        oc_codes = oferta_info.get("oc_codes", [])
+        offers.append({
             **row,
-            "oc_codes":    oc_map.get(row["codigo_requerimiento"], []),
-            "oc_urls":     [f"{_CA_PO_BASE}?CodigoOC={c}" for c in oc_map.get(row["codigo_requerimiento"], [])],
-            "ca_url":      f"{_CA_BUSCADOR_BASE}?code={row['codigo_requerimiento']}",
-            "ca_available": ca_map.get(row["codigo_requerimiento"], False),
-        }
-        for row in rows
-    ]
+            "oc_codes":    oc_codes,
+            "oc_urls":     [f"{_CA_PO_BASE}?CodigoOC={c}" for c in oc_codes],
+            "ca_url":      f"{_CA_BUSCADOR_BASE}?code={req}",
+            "ca_available": bool(ca_map.get(req)),
+            "razon_social": oferta_info.get("razon_social"),
+        })
     return {"offers": offers}
 
 

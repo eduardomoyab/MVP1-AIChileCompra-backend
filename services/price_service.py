@@ -396,7 +396,8 @@ class PriceService:
                 precio_unitario::numeric        AS precio_unitario,
                 precio_unitario_iva::numeric    AS precio_unitario_iva,
                 descripcion,
-                fecha_modificacion::text
+                fecha_modificacion::text,
+                id_oferta_aquiles
             FROM "{table}"
             WHERE
                 LOWER(COALESCE(es_accesorio::text,'false')) != 'true'
@@ -417,6 +418,7 @@ class PriceService:
                     "precio_unitario_iva":  int(row[2]) if row[2] else None,
                     "descripcion":          row[3],
                     "fecha_modificacion":   str(row[4])[:10] if row[4] else None,
+                    "id_oferta_aquiles":    int(row[5]) if row[5] is not None else None,
                 }
                 for row in rows
             ]
