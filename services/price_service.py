@@ -249,15 +249,17 @@ def _build_where(attrs: dict) -> Tuple[list, dict]:
             if is_list:
                 if not value:
                     continue
-                in_params = {f"{col}_{i}": str(v) for i, v in enumerate(value)}
-                in_keys = ", ".join(f":{k}" for k in in_params)
-                where_clauses.append(f"{col} IN ({in_keys})")
-                params.update(in_params)
+                or_parts = []
+                for i, v in enumerate(value):
+                    k = f"{col}_{i}"
+                    or_parts.append(f"{col} ILIKE :{k}")
+                    params[k] = f"%{v}%"
+                where_clauses.append(f"({' OR '.join(or_parts)})")
             elif is_range:
                 continue
             else:
-                where_clauses.append(f"{col} = :{col}")
-                params[col] = str(value)
+                where_clauses.append(f"{col} ILIKE :{col}")
+                params[col] = f"%{str(value)}%"
 
     return where_clauses, params
 
