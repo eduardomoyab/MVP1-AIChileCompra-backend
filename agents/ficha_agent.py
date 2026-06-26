@@ -182,6 +182,34 @@ Ejemplos:
 - "ponle un buen procesador i5" → `{{"linea_procesador": "Intel Core i5"}}`  ✓  (no inventar modelo)
 - "Intel Core i5-6500" en ficha_updates sin que el usuario lo dijera → ✗ PROHIBIDO
 
+## REGLA MÚLTIPLES VALORES Y RANGOS
+
+Varios atributos admiten múltiples opciones (array JSON) o rangos (dict con min/max). Úsalos cuando el usuario pide alternativas o un intervalo.
+
+**Atributos que admiten lista de opciones** (`[v1, v2, ...]`):
+- Texto/enum: `linea_procesador`, `marca`, `gpu_dedicada_nombre`, `sistema_operativo`, `tipo_equipo`, `tecnologia_ram`, `tecnologia_disco_principal`, `wifi_generacion`
+- Numéricos: `total_ram_gb`, `total_almacenamiento_gb`, `pantalla_pulgadas`
+
+**Atributos numéricos que además admiten rango** (`{{"min": x, "max": y}}`):
+`total_ram_gb`, `total_almacenamiento_gb`, `pantalla_pulgadas`
+
+**Atributos que NO admiten lista** (siempre valor único):
+- `procesador_principal`: usar siempre string (un modelo exacto). Si el usuario quiere múltiples opciones de procesador, usa `linea_procesador` con lista en su lugar.
+- `tiene_gpu_dedicada`: booleano, valor único.
+
+**Regla AGREGAR vs REEMPLAZAR** — clave: mira el historial para saber el valor actual.
+- Usuario dice "también", "agrega", "añade", "o también", "además" → **array con el valor anterior + el nuevo**. NUNCA descartes valores anteriores.
+- Usuario dice "mejor solo X", "cámbialo a X", "no ese sino X" → **reemplaza** con el nuevo valor (string/número, no array).
+
+Ejemplos (historial previo: `linea_procesador: "Intel Core i5"`, `marca: "HP"`):
+- "ponle también AMD Ryzen 5" → `{{"linea_procesador": ["Intel Core i5", "AMD Ryzen 5"]}}`  ✓
+- "agrega Dell como alternativa" → `{{"marca": ["HP", "Dell"]}}`  ✓
+- "entre 16 y 32 GB de RAM" → `{{"total_ram_gb": {{"min": 16, "max": 32}}}}`  ✓
+- "512 o 1000 GB de almacenamiento" → `{{"total_almacenamiento_gb": [512, 1000]}}`  ✓
+- "pantalla entre 14 y 15.6 pulgadas" → `{{"pantalla_pulgadas": {{"min": 14.0, "max": 15.6}}}}`  ✓
+- "no ese, mejor solo AMD Ryzen 5" → `{{"linea_procesador": "AMD Ryzen 5"}}`  ✓  (reemplazo)
+- "mínimo 16 GB de RAM" → `{{"total_ram_gb": {{"min": 16}}}}`  ✓
+
 ## REGLA 0: RESPETO A DECISIONES EXPLÍCITAS DEL USUARIO
 
 Si el usuario indica explícitamente que quiere algo concreto (una marca, un procesador, una cantidad de RAM, etc.), **acéptalo siempre sin cuestionar ni intentar cambiar su decisión**, aunque no coincida con tu recomendación. Tu rol es asistir, no decidir. Puedes mencionar brevemente una alternativa si es muy relevante, pero en ese mismo turno debes igualmente registrar lo que el usuario pidió.
@@ -338,20 +366,27 @@ class FichaAgent:
                 messages=messages,
                 temperature=self.temperature,
                 stream=True,
+                stream_options={"include_usage": True},
             )
         except Exception as e:
             logging.error(f"Error OpenAI streaming: {e}")
             err = "Lo siento, ocurrió un error al procesar tu mensaje. Intenta nuevamente."
             yield ("chunk", err)
-            yield ("done", {"message": err, "ficha_updates": [], "complement_updates": [], "questions": []})
+            yield ("done", {"message": err, "ficha_updates": [], "complement_updates": [], "questions": [], "tokens": None})
             return
 
         buf = ""          # caracteres recibidos aún no enviados al cliente
         msg_text = ""     # todo lo enviado como chunks de mensaje
         json_text = ""    # texto acumulado después del separador
         in_json = False
+        _usage = None
 
         async for raw_chunk in stream:
+            # El último chunk con include_usage=True trae usage pero choices vacío
+            if not raw_chunk.choices:
+                if raw_chunk.usage:
+                    _usage = raw_chunk.usage
+                continue
             delta = raw_chunk.choices[0].delta.content or ""
             if not delta:
                 continue
@@ -388,7 +423,7 @@ class FichaAgent:
                 yield ("chunk", buf)
                 msg_text += buf
             session["history"].append({"role": "assistant", "content": msg_text})
-            yield ("done", {"message": msg_text, "ficha_updates": [], "complement_updates": [], "questions": []})
+            yield ("done", {"message": msg_text, "ficha_updates": [], "complement_updates": [], "questions": [], "tokens": _usage})
             return
 
         # Guardar en historial
@@ -452,6 +487,7 @@ class FichaAgent:
             "ficha_updates": ficha_updates,
             "complement_updates": complement_updates,
             "questions": questions,
+            "tokens": _usage,
         })
 
     async def process_message(

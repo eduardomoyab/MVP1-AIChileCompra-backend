@@ -14,10 +14,9 @@ import os
 import json
 import logging
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
-
-import httpx
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -31,6 +30,7 @@ from agents.ficha_agent import FichaAgent, FILLABLE_ATTRIBUTES
 from services.price_service import PriceService
 from services.lgbm_price_service import LgbmPriceService
 from services.guardrail_service import GuardrailService
+from services import analytics_service
 
 load_dotenv()
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -49,6 +49,9 @@ agent: FichaAgent = None
 # Historial liviano por sesión para el guardrail (máx 20 mensajes por sesión)
 _session_histories: dict[str, list[dict]] = {}
 _HISTORY_MAX = 20
+
+# Caché del último estimate por sesión para evitar re-query en /api/offers
+_session_price_cache: dict[str, dict] = {}
 
 # ─── API Key ──────────────────────────────────────────────────────────────────
 
@@ -161,6 +164,7 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
         return StreamingResponse(empty(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     async def event_gen():
+        t0 = time.perf_counter()
         try:
             # ── Guardrail: validar mensaje antes de procesarlo ──────────────
             history = _session_histories.get(session_id, [])
@@ -170,6 +174,14 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
                 logging.info(f"[guardrail] Bloqueado session={session_id}: {block_reason}")
                 yield sse({"type": "blocked", "message": block_reason})
                 yield "data: [DONE]\n\n"
+                analytics_service.log(
+                    session_id=session_id,
+                    tipo="blocked",
+                    user_msg=content,
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                    blocked=True,
+                    block_reason=block_reason,
+                )
                 return
 
             # Usar la versión limpia si el guardrail extrajo solo la parte válida
@@ -208,19 +220,37 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
             if result.get("questions"):
                 yield sse({"type": "questions", "questions": result["questions"]})
 
+            price_found = False
             ficha = agent.get_ficha(session_id)
             if ficha.get("tipo_equipo"):
                 try:
                     price = await asyncio.to_thread(price_service.estimate, ficha)
                     if price:
+                        _session_price_cache[session_id] = price
+                        price_found = True
                         yield sse({"type": "price_update", "data": price})
                     else:
+                        _session_price_cache.pop(session_id, None)
                         yield sse({"type": "price_not_found"})
                 except Exception as e:
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
 
             yield "data: [DONE]\n\n"
+
+            usage = result.get("tokens")
+            analytics_service.log(
+                session_id=session_id,
+                tipo="chat",
+                user_msg=content,
+                ai_msg=result.get("message", ""),
+                tokens_in=usage.prompt_tokens if usage else None,
+                tokens_out=usage.completion_tokens if usage else None,
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                n_updates=len(result.get("ficha_updates", [])),
+                price_found=price_found,
+                model=agent.model,
+            )
 
         except Exception as e:
             logging.error(f"Error en chat SSE {session_id}: {e}", exc_info=True)
@@ -241,6 +271,7 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
         return StreamingResponse(err(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     async def event_gen():
+        t0 = time.perf_counter()
         try:
             result = agent.apply_manual_update(session_id, body.attribute, body.value)
 
@@ -250,19 +281,32 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
             if result["complement_updates"]:
                 yield sse({"type": "ficha_update", "updates": result["complement_updates"]})
 
+            price_found = False
             ficha = agent.get_ficha(session_id)
             if ficha.get("tipo_equipo"):
                 try:
                     price = await asyncio.to_thread(price_service.estimate, ficha)
                     if price:
+                        _session_price_cache[session_id] = price
+                        price_found = True
                         yield sse({"type": "price_update", "data": price})
                     else:
+                        _session_price_cache.pop(session_id, None)
                         yield sse({"type": "price_not_found"})
                 except Exception as e:
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
 
             yield "data: [DONE]\n\n"
+
+            analytics_service.log(
+                session_id=session_id,
+                tipo="manual_update",
+                user_msg=f"{body.attribute}={body.value}",
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                n_updates=len(result.get("updates", [])),
+                price_found=price_found,
+            )
 
         except Exception as e:
             logging.error(f"Error en manual_update SSE {session_id}: {e}", exc_info=True)
@@ -274,9 +318,25 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
 
 # ─── Offers ───────────────────────────────────────────────────────────────────
 
-_CA_API_BASE      = "https://servicios-compra-agil.mercadopublico.cl/v1/compra-agil/solicitud"
 _CA_PO_BASE       = "https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx"
 _CA_BUSCADOR_BASE = "https://buscador.mercadopublico.cl/ficha"
+
+
+def _enrich_offers(rows: list) -> list:
+    result = []
+    for row in rows:
+        req = row["codigo_requerimiento"]
+        oc_code = row.get("codigo_oc")
+        oc_codes = [oc_code] if oc_code else []
+        result.append({
+            **row,
+            "oc_codes":     oc_codes,
+            "oc_urls":      [f"{_CA_PO_BASE}?CodigoOC={c}" for c in oc_codes],
+            "ca_url":       f"{_CA_BUSCADOR_BASE}?code={req}",
+            "ca_available": bool(req),
+        })
+    return result
+
 
 @app.get("/api/offers/{session_id}")
 async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)):
@@ -284,71 +344,12 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
     if not ficha.get("tipo_equipo"):
         return {"offers": []}
 
-    price_data = await asyncio.to_thread(price_service.estimate, ficha)
-    p25 = price_data.get("p25") if price_data else None
-    p75 = price_data.get("p75") if price_data else None
+    cached = _session_price_cache.get(session_id, {})
+    p25 = cached.get("p25")
+    p75 = cached.get("p75")
 
     rows = await asyncio.to_thread(price_service.get_offer_rows, ficha, 30, p25, p75)
-    if not rows:
-        return {"offers": []}
-
-    token = await asyncio.to_thread(price_service.get_token)
-    unique_reqs = list(dict.fromkeys(r["codigo_requerimiento"] for r in rows if r["codigo_requerimiento"]))
-    # req_code -> {oferta_id -> {"oc_codes": [...], "razon_social": str|None}}
-    req_oferta_map: dict[str, dict[int, dict]] = {req: {} for req in unique_reqs}
-    ca_map: dict[str, bool] = {req: False for req in unique_reqs}
-
-    if token and unique_reqs:
-        sem = asyncio.Semaphore(5)
-
-        async def fetch_req(req_code: str):
-            async with sem:
-                try:
-                    async with httpx.AsyncClient(timeout=8.0, verify=False) as client:
-                        resp = await client.get(
-                            f"{_CA_API_BASE}/{req_code}?size=20&page=0",
-                            headers={"Authorization": f"Bearer {token}"},
-                        )
-                    if resp.status_code == 200:
-                        ofertas = (resp.json().get("payload") or {}).get("ofertas") or []
-                        oferta_data: dict[int, dict] = {}
-                        for o in ofertas:
-                            oid = o.get("id")
-                            if oid is None:
-                                continue
-                            oc_codes = list(dict.fromkeys(
-                                oc["code"]
-                                for oc in (o.get("ordenesCompra") or [])
-                                if oc.get("code")
-                            ))
-                            oferta_data[int(oid)] = {
-                                "oc_codes":    oc_codes,
-                                "razon_social": o.get("razonSocial"),
-                            }
-                        return req_code, oferta_data, True
-                except Exception as e:
-                    logging.warning(f"[fetch_oc] {req_code}: {e}")
-            return req_code, {}, False
-
-        results = await asyncio.gather(*[fetch_req(r) for r in unique_reqs])
-        req_oferta_map = {req: data for req, data, _ in results}
-        ca_map = {req: ok for req, _, ok in results}
-
-    offers = []
-    for row in rows:
-        req = row["codigo_requerimiento"]
-        oferta_id = row.get("id_oferta_aquiles")
-        oferta_info = req_oferta_map.get(req, {}).get(oferta_id, {}) if oferta_id else {}
-        oc_codes = oferta_info.get("oc_codes", [])
-        offers.append({
-            **row,
-            "oc_codes":    oc_codes,
-            "oc_urls":     [f"{_CA_PO_BASE}?CodigoOC={c}" for c in oc_codes],
-            "ca_url":      f"{_CA_BUSCADOR_BASE}?code={req}",
-            "ca_available": bool(ca_map.get(req)),
-            "razon_social": oferta_info.get("razon_social"),
-        })
-    return {"offers": offers}
+    return {"offers": _enrich_offers(rows)}
 
 
 # ─── Reset ────────────────────────────────────────────────────────────────────
@@ -357,6 +358,7 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
 async def reset_endpoint(session_id: str, _: str = Depends(require_api_key)):
     agent.reset_session(session_id)
     _session_histories.pop(session_id, None)
+    _session_price_cache.pop(session_id, None)
     return {"type": "reset_ok"}
 
 

@@ -350,22 +350,6 @@ class PriceService:
         global _dropdown_cache
         _dropdown_cache = self._fetch_dropdown_values()
 
-    def get_token(self) -> Optional[str]:
-        engine = _get_engine()
-        if not engine:
-            return None
-        try:
-            with engine.connect() as conn:
-                row = conn.execute(
-                    text("SELECT access_token FROM token_store ORDER BY id DESC LIMIT 1")
-                ).fetchone()
-            if not row:
-                logging.warning("[token_store] No hay registros — no se pueden obtener OC codes")
-                return None
-            return row[0]
-        except Exception as e:
-            logging.warning(f"[token_store] No se pudo leer el token: {e}")
-            return None
 
     def get_offer_rows(
         self,
@@ -399,7 +383,9 @@ class PriceService:
                 precio_unitario_iva::numeric    AS precio_unitario_iva,
                 descripcion,
                 fecha_modificacion::text,
-                id_oferta_aquiles
+                id_oferta_aquiles,
+                codigo_oc,
+                razon_social_ganador
             FROM "{table}"
             WHERE
                 LOWER(COALESCE(es_accesorio::text,'false')) != 'true'
@@ -421,6 +407,8 @@ class PriceService:
                     "descripcion":          row[3],
                     "fecha_modificacion":   str(row[4])[:10] if row[4] else None,
                     "id_oferta_aquiles":    int(row[5]) if row[5] is not None else None,
+                    "codigo_oc":            row[6],
+                    "razon_social":         row[7],
                 }
                 for row in rows
             ]
