@@ -239,6 +239,7 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
             yield "data: [DONE]\n\n"
 
             usage = result.get("tokens")
+            ficha_updates = result.get("ficha_updates", [])
             analytics_service.log(
                 session_id=session_id,
                 tipo="chat",
@@ -247,9 +248,10 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
                 tokens_in=usage.prompt_tokens if usage else None,
                 tokens_out=usage.completion_tokens if usage else None,
                 duration_ms=int((time.perf_counter() - t0) * 1000),
-                n_updates=len(result.get("ficha_updates", [])),
+                n_updates=len(ficha_updates),
                 price_found=price_found,
                 model=agent.model,
+                attrs_updated=",".join(u["attribute"] for u in ficha_updates) or None,
             )
 
         except Exception as e:
@@ -306,6 +308,7 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
                 duration_ms=int((time.perf_counter() - t0) * 1000),
                 n_updates=len(result.get("updates", [])),
                 price_found=price_found,
+                attrs_updated=body.attribute,
             )
 
         except Exception as e:

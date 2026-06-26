@@ -73,12 +73,12 @@ def _write_sync(row: dict) -> None:
                     (session_id, tipo, user_msg, ai_msg,
                      tokens_in, tokens_out, tokens_tot,
                      duration_ms, n_updates, price_found,
-                     blocked, block_reason, model)
+                     blocked, block_reason, model, attrs_updated)
                 VALUES
                     (:session_id, :tipo, :user_msg, :ai_msg,
                      :tokens_in, :tokens_out, :tokens_tot,
                      :duration_ms, :n_updates, :price_found,
-                     :blocked, :block_reason, :model)
+                     :blocked, :block_reason, :model, :attrs_updated)
             """), row)
             conn.commit()
     except Exception as e:
@@ -98,6 +98,7 @@ def log(
     blocked: bool = False,
     block_reason: Optional[str] = None,
     model: Optional[str] = None,
+    attrs_updated: Optional[str] = None,
 ) -> None:
     """
     Fire-and-forget: registra una métrica en background sin bloquear.
@@ -117,6 +118,7 @@ def log(
         "blocked":      blocked,
         "block_reason": (block_reason or "")[:500] if block_reason else None,
         "model":        model,
+        "attrs_updated": attrs_updated,
     }
     try:
         loop = asyncio.get_running_loop()
