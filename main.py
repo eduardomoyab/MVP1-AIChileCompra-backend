@@ -349,7 +349,19 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
     p75 = cached.get("p75")
 
     rows = await asyncio.to_thread(price_service.get_offer_rows, ficha, 30, p25, p75)
+    analytics_service.log(session_id=session_id, tipo="ver_historial")
     return {"offers": _enrich_offers(rows)}
+
+
+# ─── Track evento frontend ────────────────────────────────────────────────────
+
+class TrackRequest(BaseModel):
+    tipo: str
+
+@app.post("/api/track/{session_id}")
+async def track_endpoint(session_id: str, body: TrackRequest, _: str = Depends(require_api_key)):
+    analytics_service.log(session_id=session_id, tipo=body.tipo)
+    return {"ok": True}
 
 
 # ─── Reset ────────────────────────────────────────────────────────────────────
