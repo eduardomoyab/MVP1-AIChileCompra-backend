@@ -14,6 +14,7 @@ import os
 import json
 import logging
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -28,6 +29,8 @@ from agents.attribute_matcher import AttributeMatcher
 from agents.ficha_agent import FichaAgent, FILLABLE_ATTRIBUTES
 from services.price_service import PriceService
 from services.lgbm_price_service import LgbmPriceService
+from services.guardrail_service import GuardrailService
+from services import analytics_service
 
 load_dotenv()
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -40,7 +43,15 @@ logging.basicConfig(
 matcher = AttributeMatcher()
 price_service = PriceService()
 lgbm_service = LgbmPriceService()
+guardrail = GuardrailService()
 agent: FichaAgent = None
+
+# Historial liviano por sesión para el guardrail (máx 20 mensajes por sesión)
+_session_histories: dict[str, list[dict]] = {}
+_HISTORY_MAX = 20
+
+# Caché del último estimate por sesión para evitar re-query en /api/offers
+_session_price_cache: dict[str, dict] = {}
 
 # ─── API Key ──────────────────────────────────────────────────────────────────
 
@@ -58,11 +69,11 @@ async def require_api_key(x_api_key: Optional[str] = Depends(_api_key_header)):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global agent
-    logging.info("Iniciando servidor — calentando índices FAISS...")
-    matcher.warm()
     agent = FichaAgent(matcher)
     lgbm_service._load()
-    logging.info("Servidor listo")
+    logging.info("Servidor listo — construyendo índices FAISS y dropdowns en background...")
+    asyncio.create_task(asyncio.to_thread(matcher.warm))
+    asyncio.create_task(asyncio.to_thread(price_service.warmup_dropdowns))
     yield
     logging.info("Servidor apagado")
 
@@ -125,6 +136,22 @@ async def get_schema():
     return {"categoria": "Computadores", "attributes": schema}
 
 
+# ─── Dropdowns ────────────────────────────────────────────────────────────────
+
+# Atributos que se resuelven desde el diccionario FAISS (no están en PrecioCA)
+_DICT_DROPDOWN_ATTRS = [
+    "gpu_dedicada_nombre",
+    "total_vram_gpu_gb",
+]
+
+@app.get("/api/dropdowns")
+async def get_dropdowns():
+    db_values = await asyncio.to_thread(price_service.get_dropdown_values)
+    for attr in _DICT_DROPDOWN_ATTRS:
+        db_values[attr] = matcher.get_valid_values("Computadores", attr)
+    return db_values
+
+
 # ─── Chat (SSE) ───────────────────────────────────────────────────────────────
 
 @app.post("/api/chat/{session_id}")
@@ -137,17 +164,52 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
         return StreamingResponse(empty(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     async def event_gen():
+        t0 = time.perf_counter()
         try:
+            # ── Guardrail: validar mensaje antes de procesarlo ──────────────
+            history = _session_histories.get(session_id, [])
+            allowed, block_reason, clean_message = await guardrail.check(content, history)
+
+            if not allowed:
+                logging.info(f"[guardrail] Bloqueado session={session_id}: {block_reason}")
+                yield sse({"type": "blocked", "message": block_reason})
+                yield "data: [DONE]\n\n"
+                analytics_service.log(
+                    session_id=session_id,
+                    tipo="blocked",
+                    user_msg=content,
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                    blocked=True,
+                    block_reason=block_reason,
+                )
+                return
+
+            # Usar la versión limpia si el guardrail extrajo solo la parte válida
+            effective_content = clean_message if clean_message else content
+            if clean_message:
+                logging.info(f"[guardrail] Mensaje parcial limpiado session={session_id}: {block_reason}")
+
+            # Registrar mensaje original del usuario en el historial
+            history.append({"role": "user", "content": content})
+            if len(history) > _HISTORY_MAX:
+                history = history[-_HISTORY_MAX:]
+            _session_histories[session_id] = history
+
             yield sse({"type": "thinking"})
 
             result = {}
-            async for event_type, event_data in agent.stream_process_message(session_id, content):
+            async for event_type, event_data in agent.stream_process_message(session_id, effective_content):
                 if event_type == "chunk":
                     yield sse({"type": "assistant_chunk", "delta": event_data})
                 elif event_type == "done":
                     result = event_data
 
             yield sse({"type": "assistant_done"})
+
+            # Registrar respuesta del asistente para contexto futuro del guardrail
+            if result.get("message"):
+                history.append({"role": "assistant", "content": result["message"][:400]})
+                _session_histories[session_id] = history[-_HISTORY_MAX:]
 
             if result.get("ficha_updates"):
                 yield sse({"type": "ficha_update", "updates": result["ficha_updates"]})
@@ -158,29 +220,39 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
             if result.get("questions"):
                 yield sse({"type": "questions", "questions": result["questions"]})
 
+            price_found = False
             ficha = agent.get_ficha(session_id)
             if ficha.get("tipo_equipo"):
                 try:
                     price = await asyncio.to_thread(price_service.estimate, ficha)
                     if price:
+                        _session_price_cache[session_id] = price
+                        price_found = True
                         yield sse({"type": "price_update", "data": price})
                     else:
+                        _session_price_cache.pop(session_id, None)
                         yield sse({"type": "price_not_found"})
                 except Exception as e:
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
 
-                try:
-                    lgbm = await asyncio.to_thread(lgbm_service.predict, ficha)
-                    if lgbm:
-                        yield sse({"type": "lgbm_price_update", "data": lgbm})
-                    else:
-                        yield sse({"type": "lgbm_price_not_found"})
-                except Exception as e:
-                    logging.warning(f"Error en estimación LGBM: {e}")
-                    yield sse({"type": "lgbm_price_not_found"})
-
             yield "data: [DONE]\n\n"
+
+            usage = result.get("tokens")
+            ficha_updates = result.get("ficha_updates", [])
+            analytics_service.log(
+                session_id=session_id,
+                tipo="chat",
+                user_msg=content,
+                ai_msg=result.get("message", ""),
+                tokens_in=usage.prompt_tokens if usage else None,
+                tokens_out=usage.completion_tokens if usage else None,
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                n_updates=len(ficha_updates),
+                price_found=price_found,
+                model=agent.model,
+                attrs_updated=",".join(u["attribute"] for u in ficha_updates) or None,
+            )
 
         except Exception as e:
             logging.error(f"Error en chat SSE {session_id}: {e}", exc_info=True)
@@ -201,6 +273,7 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
         return StreamingResponse(err(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     async def event_gen():
+        t0 = time.perf_counter()
         try:
             result = agent.apply_manual_update(session_id, body.attribute, body.value)
 
@@ -210,29 +283,33 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
             if result["complement_updates"]:
                 yield sse({"type": "ficha_update", "updates": result["complement_updates"]})
 
+            price_found = False
             ficha = agent.get_ficha(session_id)
             if ficha.get("tipo_equipo"):
                 try:
                     price = await asyncio.to_thread(price_service.estimate, ficha)
                     if price:
+                        _session_price_cache[session_id] = price
+                        price_found = True
                         yield sse({"type": "price_update", "data": price})
                     else:
+                        _session_price_cache.pop(session_id, None)
                         yield sse({"type": "price_not_found"})
                 except Exception as e:
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
 
-                try:
-                    lgbm = await asyncio.to_thread(lgbm_service.predict, ficha)
-                    if lgbm:
-                        yield sse({"type": "lgbm_price_update", "data": lgbm})
-                    else:
-                        yield sse({"type": "lgbm_price_not_found"})
-                except Exception as e:
-                    logging.warning(f"Error en estimación LGBM: {e}")
-                    yield sse({"type": "lgbm_price_not_found"})
-
             yield "data: [DONE]\n\n"
+
+            analytics_service.log(
+                session_id=session_id,
+                tipo="manual_update",
+                user_msg=f"{body.attribute}={body.value}",
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                n_updates=len(result.get("updates", [])),
+                price_found=price_found,
+                attrs_updated=body.attribute,
+            )
 
         except Exception as e:
             logging.error(f"Error en manual_update SSE {session_id}: {e}", exc_info=True)
@@ -242,11 +319,61 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
     return StreamingResponse(event_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
+# ─── Offers ───────────────────────────────────────────────────────────────────
+
+_CA_PO_BASE       = "https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx"
+_CA_BUSCADOR_BASE = "https://buscador.mercadopublico.cl/ficha"
+
+
+def _enrich_offers(rows: list) -> list:
+    result = []
+    for row in rows:
+        req = row["codigo_requerimiento"]
+        oc_code = row.get("codigo_oc")
+        oc_codes = [oc_code] if oc_code else []
+        result.append({
+            **row,
+            "oc_codes":     oc_codes,
+            "oc_urls":      [f"{_CA_PO_BASE}?CodigoOC={c}" for c in oc_codes],
+            "ca_url":       f"{_CA_BUSCADOR_BASE}?code={req}",
+            "ca_available": bool(req),
+        })
+    return result
+
+
+@app.get("/api/offers/{session_id}")
+async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)):
+    ficha = agent.get_ficha(session_id)
+    if not ficha.get("tipo_equipo"):
+        return {"offers": []}
+
+    cached = _session_price_cache.get(session_id, {})
+    p25 = cached.get("p25")
+    p75 = cached.get("p75")
+
+    rows = await asyncio.to_thread(price_service.get_offer_rows, ficha, 30, p25, p75)
+    analytics_service.log(session_id=session_id, tipo="ver_historial")
+    return {"offers": _enrich_offers(rows)}
+
+
+# ─── Track evento frontend ────────────────────────────────────────────────────
+
+class TrackRequest(BaseModel):
+    tipo: str
+
+@app.post("/api/track/{session_id}")
+async def track_endpoint(session_id: str, body: TrackRequest, _: str = Depends(require_api_key)):
+    analytics_service.log(session_id=session_id, tipo=body.tipo)
+    return {"ok": True}
+
+
 # ─── Reset ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/reset/{session_id}")
 async def reset_endpoint(session_id: str, _: str = Depends(require_api_key)):
     agent.reset_session(session_id)
+    _session_histories.pop(session_id, None)
+    _session_price_cache.pop(session_id, None)
     return {"type": "reset_ok"}
 
 

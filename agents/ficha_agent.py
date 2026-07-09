@@ -80,6 +80,15 @@ FILLABLE_ATTRIBUTES = {
     },
 }
 
+# Campos a limpiar cuando el atributo disparador recibe un valor multi-selección
+_MULTI_VALUE_CLEARS: Dict[str, List[str]] = {
+    "procesador_principal": [
+        "linea_procesador", "generacion_procesador",
+        "nucleos_procesador", "hilos_procesador", "frecuencia_turbo_procesador_mhz",
+    ],
+    "gpu_dedicada_nombre": ["total_vram_gpu_gb", "tecnologia_gpu_principal"],
+}
+
 # Atributos que se completan automáticamente por complemento (el LLM no los toca)
 COMPLEMENT_ONLY_ATTRIBUTES = {
     "nucleos_procesador",
@@ -88,7 +97,6 @@ COMPLEMENT_ONLY_ATTRIBUTES = {
     "frecuencia_ram_mhz",
     "total_vram_gpu_gb",
     "tecnologia_gpu_principal",
-    "linea_procesador",
     "generacion_procesador",
 }
 
@@ -159,14 +167,94 @@ Tu misión es entender qué necesita el usuario y completar la ficha con las esp
 
 {attrs_str}
 
-**NUNCA incluyas en ficha_updates**: nucleos_procesador, hilos_procesador, frecuencia_turbo_procesador_mhz, frecuencia_ram_mhz, total_vram_gpu_gb, linea_procesador, generacion_procesador, tecnologia_gpu_principal. Esos se completan solos.
+**NUNCA incluyas en ficha_updates**: nucleos_procesador, hilos_procesador, frecuencia_turbo_procesador_mhz, frecuencia_ram_mhz, total_vram_gpu_gb, generacion_procesador, tecnologia_gpu_principal. Esos se completan solos.
 
-## REGLA PRINCIPAL: PARA QUÉ SE USA EL EQUIPO
+**REGLA PROCESADOR — distinción crítica**:
+- `procesador_principal`: SOLO cuando el usuario indica un modelo EXACTO con número (ej: "i5-1335U", "Ryzen 7 7745HX"). **NUNCA inventes ni sugeras un modelo específico por tu cuenta.**
+- `linea_procesador`: cuando el usuario menciona la familia sin número de modelo (ej: "Intel Core i5", "AMD Ryzen 7", "un i5"). Úsalo siempre que no haya un número de modelo explícito del usuario.
 
-**Antes de sugerir especificaciones, debes saber para qué se va a usar el equipo.**
-- Si el usuario no lo mencionó, tu única pregunta en ese turno debe ser para qué lo van a usar.
-- Sin conocer el uso, NO completes RAM, almacenamiento, procesador ni GPU. Solo puedes inferir tipo_equipo si es obvio.
-- Una vez que sepas el uso, llena todos los atributos que puedas.
+**Regla de oro**: si el número de modelo NO aparece textualmente en el mensaje del usuario, usa `linea_procesador` y deja `procesador_principal` vacío, A MENOS QUE el usuario te pida explícitamente que elijas o sugieras un modelo (frases como "tú elige uno", "sugiéreme uno", "el que sea mejor", "ponle el que corresponda").
+
+Ejemplos:
+- "ponle un intel core i5" → `{{"linea_procesador": "Intel Core i5"}}`  ✓
+- "intel core i5, ninguno en específico" → `{{"linea_procesador": "Intel Core i5"}}`  ✓
+- "quiero un i5-1335U" → `{{"procesador_principal": "Intel Core i5-1335U"}}`  ✓
+- "ponle un buen procesador i5" → `{{"linea_procesador": "Intel Core i5"}}`  ✓  (no inventar modelo)
+- "Intel Core i5-6500" en ficha_updates sin que el usuario lo dijera → ✗ PROHIBIDO
+
+## REGLA MÚLTIPLES VALORES Y RANGOS
+
+Varios atributos admiten múltiples opciones (array JSON) o rangos (dict con min/max). Úsalos cuando el usuario pide alternativas o un intervalo.
+
+**Atributos que admiten lista de opciones** (`[v1, v2, ...]`):
+- Texto/enum: `linea_procesador`, `marca`, `gpu_dedicada_nombre`, `sistema_operativo`, `tipo_equipo`, `tecnologia_ram`, `tecnologia_disco_principal`, `wifi_generacion`
+- Numéricos: `total_ram_gb`, `total_almacenamiento_gb`, `pantalla_pulgadas`
+
+**Atributos numéricos que además admiten rango** (`{{"min": x, "max": y}}`):
+`total_ram_gb`, `total_almacenamiento_gb`, `pantalla_pulgadas`
+
+**Atributos que NO admiten lista** (siempre valor único):
+- `procesador_principal`: usar siempre string (un modelo exacto). Si el usuario quiere múltiples opciones de procesador, usa `linea_procesador` con lista en su lugar.
+- `tiene_gpu_dedicada`: booleano, valor único.
+
+**Regla AGREGAR vs REEMPLAZAR** — clave: mira el historial para saber el valor actual.
+- Usuario dice "también", "agrega", "añade", "o también", "además" → **array con el valor anterior + el nuevo**. NUNCA descartes valores anteriores.
+- Usuario dice "mejor solo X", "cámbialo a X", "no ese sino X" → **reemplaza** con el nuevo valor (string/número, no array).
+
+Ejemplos (historial previo: `linea_procesador: "Intel Core i5"`, `marca: "HP"`):
+- "ponle también AMD Ryzen 5" → `{{"linea_procesador": ["Intel Core i5", "AMD Ryzen 5"]}}`  ✓
+- "agrega Dell como alternativa" → `{{"marca": ["HP", "Dell"]}}`  ✓
+- "entre 16 y 32 GB de RAM" → `{{"total_ram_gb": {{"min": 16, "max": 32}}}}`  ✓
+- "512 o 1000 GB de almacenamiento" → `{{"total_almacenamiento_gb": [512, 1000]}}`  ✓
+- "pantalla entre 14 y 15.6 pulgadas" → `{{"pantalla_pulgadas": {{"min": 14.0, "max": 15.6}}}}`  ✓
+- "no ese, mejor solo AMD Ryzen 5" → `{{"linea_procesador": "AMD Ryzen 5"}}`  ✓  (reemplazo)
+- "mínimo 16 GB de RAM" → `{{"total_ram_gb": {{"min": 16}}}}`  ✓
+
+## REGLA 0: RESPETO A DECISIONES EXPLÍCITAS DEL USUARIO
+
+Si el usuario indica explícitamente que quiere algo concreto (una marca, un procesador, una cantidad de RAM, etc.), **acéptalo siempre sin cuestionar ni intentar cambiar su decisión**, aunque no coincida con tu recomendación. Tu rol es asistir, no decidir. Puedes mencionar brevemente una alternativa si es muy relevante, pero en ese mismo turno debes igualmente registrar lo que el usuario pidió.
+
+Ejemplos de decisiones explícitas a respetar:
+- "quiero 32 GB de RAM" → registra 32 GB aunque el uso no lo justifique
+- "prefiero HP" → registra marca HP
+- "lo quiero con GPU dedicada" → registra tiene_gpu_dedicada: true
+
+## REGLA DESCRIPCIÓN TÉCNICA (PRIORIDAD MÁXIMA — se aplica antes que cualquier otra)
+
+Si el mensaje contiene una descripción técnica estructurada — es decir, menciona números de modelo con guión (ej: "i7-13620H", "RTX 4050", "15-FA1097"), medidas explícitas con unidad, o tiene formato de especificación de producto — **debes extraer TODOS los atributos visibles de forma inmediata, sin preguntar por el uso**:
+
+1. Mapea cada dato explícito al atributo correspondiente.
+2. Usa tu conocimiento base para inferir atributos que se desprenden del modelo mencionado (ej: si dice "NVIDIA RTX 4050", infiere `tiene_gpu_dedicada: true` y `gpu_dedicada_nombre: "NVIDIA RTX 4050"`).
+3. Convierte unidades: "1 TB" → 1000 GB; "512 GB" → 512.
+4. Si dice "SSD" sin más detalle, usa `tecnologia_disco_principal: "SSD"`. Si dice "NVMe SSD", usa "NVMe SSD".
+5. No hagas preguntas en este turno si ya tienes suficiente información de la descripción.
+
+Señales de que el input es una descripción técnica:
+- Contiene modelos con guion: "i7-13620H", "Ryzen 5 7530U", "RTX 3050"
+- Menciona múltiples specs en una misma frase: RAM, disco, GPU, SO
+- Usa términos técnicos con valores: "16 GB RAM", "1 TB SSD", "Windows 11 Pro"
+- Tiene formato de lista o especificación de compra pública
+
+## REGLA PRINCIPAL: EXPLORAR EL PROPÓSITO ANTES DE ESPECIFICAR
+
+**Esta regla se aplica solo cuando el mensaje NO es una descripción técnica.**
+
+**Antes de sugerir especificaciones técnicas, debes conocer bien para qué se usará el equipo.**
+
+- Si el usuario no mencionó el uso, pregunta exclusivamente por eso en ese turno.
+- Sin conocer el uso, NO completes RAM, almacenamiento, procesador ni GPU. Solo puedes inferir tipo_equipo si es muy obvio.
+- Una vez que el usuario dé un uso inicial, **sigue haciendo preguntas de seguimiento** para afinar el perfil funcional. No llenes la ficha hasta tener claridad suficiente.
+
+**Cuándo dejar de preguntar y llenar la ficha** (basta con UNA de estas condiciones):
+1. Tienes suficiente contexto para determinar con confianza las especificaciones adecuadas (conoces el uso, la intensidad y los programas principales).
+2. El usuario indica explícitamente que ya entregó suficiente información (frases como "con eso basta", "ya es suficiente", "listo", "procede", "con eso nomás").
+
+**Preguntas de seguimiento útiles según el uso declarado:**
+- Oficina: ¿usa programas específicos además de Office? ¿maneja bases de datos, macros complejas o muchos archivos abiertos?
+- Programación: ¿qué lenguajes/tecnologías? ¿corre servidores locales o contenedores?
+- Diseño: ¿edita fotos, video o 3D? ¿qué programas usa (Photoshop, Premiere, Blender)?
+- Análisis de datos: ¿trabaja con modelos de ML, datasets grandes o solo Excel/Power BI?
+- Educación/terreno: ¿lo usará en campo sin enchufe constante? ¿necesita ser portátil y liviano?
 
 ## ESPECIFICACIONES MÍNIMAS SEGÚN USO
 
@@ -182,14 +270,14 @@ Usa siempre el mínimo adecuado. No pongas más de lo necesario.
 
 ## REGLAS DE COMPORTAMIENTO
 
-1. Conocido el uso, llena TODOS los atributos que puedas determinar con confianza.
+1. Conocido el uso con suficiente detalle, llena TODOS los atributos que puedas determinar con confianza.
 2. Para los atributos con valores fijos (SOLO), usa exactamente uno de los valores indicados.
 3. Para atributos de diccionario, sugiere el valor más específico posible.
-4. Máximo UNA pregunta por turno. Prioridad: para qué se usa → tipo de equipo → otros.
+4. Máximo UNA pregunta por turno. Mientras no tengas perfil funcional claro, prioriza preguntas de uso.
 5. NO pidas ni completes: nombre_modelo, wifi_generacion, pantalla_pulgadas.
 6. NO preguntes por marca, sistema operativo ni pantalla a menos que el usuario los mencione.
-7. Si el usuario menciona una marca, modelo o especificaciones concretas, úsalas directamente.
-8. Sé breve y directo. No repitas la ficha en el mensaje. Una o dos oraciones bastan.
+7. Si el usuario menciona una marca, modelo o especificaciones concretas, úsalas directamente (ver Regla 0).
+8. Sé conciso y directo. No repitas todos los atributos en el mensaje. **Excepción**: si acabas de extraer 5 o más atributos de una descripción técnica completa, haz un resumen de los campos principales que llenaste (procesador, RAM, almacenamiento, GPU, SO) en una oración, y en la siguiente invita al usuario a agregar lo que falte con ejemplos concretos de atributos aún vacíos (tecnología de RAM, Wi-Fi, pantalla, etc.). Máximo 3 oraciones en total.
 9. Escribe en español de Chile, con un tono formal pero natural. Sin tecnicismos innecesarios.
 
 ## FORMATO DE RESPUESTA
@@ -207,13 +295,28 @@ Responde SIEMPRE con este formato exacto, nada más:
 
 ## EJEMPLOS
 
-Usuario: "quiero un equipo para la oficina, que use excel, ppt, word"
-Para trabajo de oficina con Office, 8 GB de RAM y 256 GB de disco son suficientes sin gastar de más.
+Usuario: "quiero un equipo para la oficina"
+Entendido. Para afinar las especificaciones, ¿qué programas usarán principalmente? ¿Solo Office básico o también Excel con macros, bases de datos u otras aplicaciones exigentes?
 {_SEPARATOR}
-{{"ficha_updates": {{"tipo_equipo": "Laptop", "procesador_principal": "Intel Core i5-1335U", "total_ram_gb": 8, "tecnologia_ram": "DDR4", "total_almacenamiento_gb": 256, "tecnologia_disco_principal": "NVMe SSD", "tipo_configuracion_discos": "solo SSD", "tiene_gpu_dedicada": false, "sistema_operativo": "Microsoft Windows 11 Home"}}, "questions": []}}
+{{"ficha_updates": {{"tipo_equipo": "Laptop"}}, "questions": ["¿Qué programas usarán principalmente? ¿Solo Office básico o también Excel con macros, bases de datos u otras aplicaciones más exigentes?"]}}
+
+Usuario: "solo Office, Word y Excel básico, correo, nada más exigente"
+Con ese uso, 8 GB de RAM y 256 GB de almacenamiento son suficientes.
+{_SEPARATOR}
+{{"ficha_updates": {{"linea_procesador": "Intel Core i5", "total_ram_gb": 8, "tecnologia_ram": "DDR4", "total_almacenamiento_gb": 256, "tecnologia_disco_principal": "NVMe SSD", "tipo_configuracion_discos": "solo SSD", "tiene_gpu_dedicada": false, "sistema_operativo": "Microsoft Windows 11 Home"}}, "questions": []}}
+
+Usuario: "quiero 32 GB de RAM para trabajo de oficina básico"
+Registrado con 32 GB según tu indicación.
+{_SEPARATOR}
+{{"ficha_updates": {{"total_ram_gb": 32}}, "questions": []}}
+
+Usuario: "NOTEBOOK IGUAL O SUPERIOR A HP VICTUS 15-FA1097 LA, INTEL CORE I7-13620H NVIDIA RTX 4050 (6GB DEDICADOS), MEMORIA RAM 16 GB, BLUETOOTH 5.3, DISCO SSD 1 TB, S.O WINDOWS 11 PRO ETHERNET RJ-45"
+Ficha completada con los datos de la descripción: procesador Intel Core i7-13620H, 16 GB RAM, 1 TB SSD, GPU NVIDIA RTX 4050 y Windows 11 Pro. Si quieres precisar algún detalle adicional —como la generación de Wi-Fi, tamaño de pantalla u otra característica—, escríbelo directamente y lo agrego.
+{_SEPARATOR}
+{{"ficha_updates": {{"tipo_equipo": "Laptop", "marca": "HP", "procesador_principal": "Intel Core i7-13620H", "total_ram_gb": 16, "tecnologia_ram": "DDR4", "total_almacenamiento_gb": 1000, "tecnologia_disco_principal": "SSD", "tipo_configuracion_discos": "solo SSD", "tiene_gpu_dedicada": true, "gpu_dedicada_nombre": "NVIDIA RTX 4050", "sistema_operativo": "Microsoft Windows 11 Pro"}}, "questions": []}}
 
 Usuario: "necesito un equipo"
-Para recomendarte las especificaciones correctas, necesito saber para qué lo van a usar.
+Para recomendarte las especificaciones correctas, ¿para qué lo van a usar?
 {_SEPARATOR}
 {{"ficha_updates": {{}}, "questions": ["¿Para qué se usará el equipo? (por ejemplo: trabajo de oficina, programación, diseño, edición de video)"]}}"""
 
@@ -263,20 +366,27 @@ class FichaAgent:
                 messages=messages,
                 temperature=self.temperature,
                 stream=True,
+                stream_options={"include_usage": True},
             )
         except Exception as e:
             logging.error(f"Error OpenAI streaming: {e}")
             err = "Lo siento, ocurrió un error al procesar tu mensaje. Intenta nuevamente."
             yield ("chunk", err)
-            yield ("done", {"message": err, "ficha_updates": [], "complement_updates": [], "questions": []})
+            yield ("done", {"message": err, "ficha_updates": [], "complement_updates": [], "questions": [], "tokens": None})
             return
 
         buf = ""          # caracteres recibidos aún no enviados al cliente
         msg_text = ""     # todo lo enviado como chunks de mensaje
         json_text = ""    # texto acumulado después del separador
         in_json = False
+        _usage = None
 
         async for raw_chunk in stream:
+            # El último chunk con include_usage=True trae usage pero choices vacío
+            if not raw_chunk.choices:
+                if raw_chunk.usage:
+                    _usage = raw_chunk.usage
+                continue
             delta = raw_chunk.choices[0].delta.content or ""
             if not delta:
                 continue
@@ -313,7 +423,7 @@ class FichaAgent:
                 yield ("chunk", buf)
                 msg_text += buf
             session["history"].append({"role": "assistant", "content": msg_text})
-            yield ("done", {"message": msg_text, "ficha_updates": [], "complement_updates": [], "questions": []})
+            yield ("done", {"message": msg_text, "ficha_updates": [], "complement_updates": [], "questions": [], "tokens": _usage})
             return
 
         # Guardar en historial
@@ -377,6 +487,7 @@ class FichaAgent:
             "ficha_updates": ficha_updates,
             "complement_updates": complement_updates,
             "questions": questions,
+            "tokens": _usage,
         })
 
     async def process_message(
@@ -484,9 +595,15 @@ class FichaAgent:
         """
         session = _get_session(session_id)
 
-        # Intentar normalizar si el atributo está en el diccionario
-        if attribute not in COMPLEMENT_ONLY_ATTRIBUTES and isinstance(value, str) and value.strip():
-            normalized_value, score, _ = self._normalize(attribute, value)
+        # Normalizar según tipo de valor
+        if attribute not in COMPLEMENT_ONLY_ATTRIBUTES:
+            if isinstance(value, list) or (isinstance(value, dict) and ("min" in value or "max" in value)):
+                normalized_value, score, _ = self._normalize(attribute, value)
+            elif isinstance(value, str) and value.strip():
+                normalized_value, score, _ = self._normalize(attribute, value)
+            else:
+                normalized_value = value
+                score = 1.0
         else:
             normalized_value = value
             score = 1.0
@@ -525,6 +642,22 @@ class FichaAgent:
                 })
                 session["ficha"]["linea_procesador"] = linea
 
+        # Limpiar complementos cuando se borra o se asignan múltiples valores
+        should_clear = (
+            normalized_value is None or isinstance(normalized_value, list)
+        ) and attribute in _MULTI_VALUE_CLEARS
+        if should_clear:
+            for clr_attr in _MULTI_VALUE_CLEARS[attribute]:
+                if session["ficha"].get(clr_attr) is not None:
+                    session["ficha"][clr_attr] = None
+                    complement_updates.append({
+                        "attribute": clr_attr,
+                        "value": None,
+                        "source": "complement",
+                        "triggered_by": attribute,
+                        "triggered_value": None,
+                    })
+
         return {"updates": updates, "complement_updates": complement_updates}
 
     def get_ficha(self, session_id: str) -> Dict[str, Any]:
@@ -539,6 +672,23 @@ class FichaAgent:
     def _normalize(self, attribute: str, value: Any) -> Tuple[Any, float, list]:
         meta = FILLABLE_ATTRIBUTES.get(attribute, {})
         attr_type = meta.get("type", "free")
+
+        # Lista de valores → normalizar cada elemento individualmente
+        if isinstance(value, list):
+            normalized = []
+            min_score = 1.0
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    norm, score, _ = self._normalize(attribute, item)
+                    normalized.append(norm)
+                    min_score = min(min_score, score)
+                else:
+                    normalized.append(item)
+            return normalized, min_score, []
+
+        # Rango (dict con min/max) → pasar tal cual sin normalizar
+        if isinstance(value, dict) and ("min" in value or "max" in value):
+            return value, 1.0, []
 
         # Para enums y booleanos no usamos FAISS
         if attr_type in ("enum", "boolean") or not isinstance(value, str):

@@ -1,229 +1,256 @@
-# AIChileCompra — Backend
+# Asistente IA · Compra Ágil — MVP 1
 
-API REST construida con **FastAPI (Python)** que actúa como núcleo inteligente del asistente de especificación técnica para el catálogo Compra Ágil. Procesa mensajes en lenguaje natural, extrae y estructura atributos de ficha técnica, y estima precios de referencia consultando datos históricos reales de compras públicas.
+Herramienta conversacional de IA que automatiza la preparación de **fichas técnicas de computadores** en la plataforma [Compra Ágil](https://www.mercadopublico.cl) del sistema Mercado Público de Chile.
 
----
-
-## Stack tecnológico
-
-| Capa | Tecnología |
-|---|---|
-| Framework API | FastAPI + Uvicorn |
-| LLM | OpenAI GPT-4o-mini |
-| Búsqueda semántica | FAISS + `paraphrase-multilingual-MiniLM-L12-v2` |
-| Estimación de precios (CA) | PostgreSQL + LLM-driven query refinement |
-| Estimación de precios (mercado) | LightGBM (modelos `.pkl` preentrenados) |
-| Base de datos | PostgreSQL (Railway) |
-| ORM / queries | SQLAlchemy (Core) |
-| Streaming | Server-Sent Events (SSE) |
-| Contenerización | Docker |
-| Despliegue | Railway |
+> **Estado:** Desarrollo completado · Presentado a ChileCompra · Listo para pruebas de integración  
+> **Versión:** `v1.0.0` · Primer deploy Railway: 15 mayo 2026, 12:15 PM GMT-4  
+> **Repos:** [`github.com/eduardomoyab/MVP1-AIChileCompra-backend`](https://github.com/eduardomoyab/MVP1-AIChileCompra-backend) · [`github.com/eduardomoyab/MVP1-AIChileCompra-frontend`](https://github.com/eduardomoyab/MVP1-AIChileCompra-frontend)
 
 ---
 
-## Arquitectura general
-
-```mermaid
-graph TB
-    subgraph Railway["☁️ Railway — Red Privada Interna"]
-        FE["Frontend Flask\n:5000"]
-        BE["Backend FastAPI\n:8000"]
-        PG[("PostgreSQL\nTabla PrecioCA")]
-    end
-
-    Browser["🌐 Browser"] -->|HTTPS| FE
-    FE -->|HTTP interno · x-api-key| BE
-    BE -->|SQLAlchemy| PG
-    BE -->|REST API| OAI["☁️ OpenAI\nGPT-4o-mini"]
-    BE -.->|"Vector search\n(índice en memoria)"| FAISS["FAISS\nMiniLM embeddings"]
+## Estructura del repositorio
 
 ```
-
-El backend **no tiene dominio público expuesto**: solo el frontend puede alcanzarlo mediante la red interna de Railway, eliminando cualquier acceso externo directo.
-
----
-
-## Endpoints
-
-Todos los endpoints requieren el header `x-api-key` y retornan un stream `text/event-stream` (SSE).
-
-| Método | Ruta | Descripción |
-|---|---|---|
-| `POST` | `/api/chat/{session_id}` | Procesa un mensaje del usuario y actualiza la ficha |
-| `POST` | `/api/manual_update/{session_id}` | Aplica una edición manual de atributo |
-| `POST` | `/api/reset/{session_id}` | Reinicia el estado de la sesión |
-
----
-
-## Flujo de una petición (SSE)
-
-```mermaid
-sequenceDiagram
-    participant B as Browser
-    participant F as Flask (Proxy)
-    participant A as FastAPI
-    participant O as OpenAI
-    participant P as PostgreSQL
-
-    B->>F: POST /api/chat/{session_id}
-    F->>A: POST /api/chat/{session_id} + x-api-key
-    A-->>B: SSE · type: thinking
-    A->>O: chat.completions (streaming)
-    loop Tokens del LLM
-        O-->>A: chunk de texto
-        A-->>B: SSE · type: assistant_chunk
-    end
-    A-->>B: SSE · type: assistant_done
-    A-->>B: SSE · type: ficha_update (atributos extraídos)
-    A-->>B: SSE · type: ficha_update (atributos complementados)
-    A->>P: SELECT estadísticas FROM PrecioCA WHERE ...
-    P-->>A: distribución de precios
-    A-->>B: SSE · type: price_update / price_not_found
-    A->>A: LightGBM predict(ficha)
-    A-->>B: SSE · type: lgbm_price_update / lgbm_price_not_found
-    A-->>B: data: [DONE]
+MVP1/
+├── MVP1-AIChileCompra-backend/       # API FastAPI — lógica, IA, FAISS, precios
+│   ├── agents/                       # FichaAgent, AttributeMatcher, embeddings
+│   ├── services/                     # PriceService, GuardrailService, analytics
+│   ├── diccionarios/
+│   │   ├── attribute_dictionary.csv  # Vocabulario canónico Compra Ágil
+│   │   └── attribute_complement.csv  # Reglas de atributos derivados
+│   ├── models/lgbm/                  # Modelos LightGBM (desactivados en v1.0.0)
+│   └── main.py
+└── MVP1-AIChileCompra-frontend/      # Servidor Flask — interfaz web y proxy
+    ├── app.py
+    ├── templates/index.html
+    ├── static/js/app.js
+    └── imagenes/
 ```
 
 ---
 
-## Módulos internos
-
-```mermaid
-graph LR
-    subgraph main["main.py — FastAPI"]
-        EP1["/api/chat"]
-        EP2["/api/manual_update"]
-        EP3["/api/reset"]
-    end
-
-    subgraph agents["agents/"]
-        AM["attribute_matcher.py\nNormalización FAISS\nComplemento automático"]
-        GE["get_embeddings.py\nSentenceTransformer loader"]
-    end
-
-    subgraph services["services/"]
-        PS["price_service.py\nEstimación precios CA\nLLM-driven query refinement"]
-        LS["lgbm_price_service.py\nEstimación mercado externo\nModelos LightGBM (.pkl)"]
-    end
-
-    subgraph data["diccionarios/"]
-        D1["attribute_dictionary.csv\nValores canónicos por atributo"]
-        D2["attribute_complement.csv\nAtributos derivados automáticos"]
-    end
-
-    subgraph models["models/lgbm/"]
-        M1["p25/p75/mean_agg_notebooks.pkl"]
-        M2["p25/p75/mean_agg_all_in_one.pkl"]
-    end
-
-    EP1 --> AM
-    EP2 --> AM
-    EP1 --> PS
-    EP2 --> PS
-    EP1 --> LS
-    EP2 --> LS
-    AM --> GE
-    AM --> D1
-    AM --> D2
-    LS --> M1
-    LS --> M2
-```
-
-### `agents/attribute_matcher.py`
-Carga dos CSVs con el diccionario de atributos y las reglas de complemento. Para cada atributo editable construye un índice FAISS con embeddings de los valores canónicos, permitiendo normalizar valores escritos en lenguaje natural por similitud semántica. El complemento infiere automáticamente atributos derivados: dado un `procesador_principal`, extrae `linea_procesador`, `generacion_procesador`, `nucleos_procesador`, `hilos_procesador` y `frecuencia_turbo_procesador_mhz`.
-
-### `services/price_service.py`
-Consulta la tabla `PrecioCA` en PostgreSQL con filtros dinámicos sobre los atributos de la ficha. Si la consulta inicial no retorna suficientes registros, invoca al LLM para reformular la query relajando atributos según una jerarquía de especificidad (hasta 6 iteraciones). Los registros se filtran por `precio_unitario` entre 200 000 y 5 000 000 CLP (sin IVA).
-
-### `services/lgbm_price_service.py`
-Estima el precio de mercado externo usando seis modelos LightGBM preentrenados (P25, P75 y media para `notebooks` y `all_in_one`). Construye un DataFrame de una fila con los atributos de la ficha (incluyendo features temporales: `year`, `month`, `week_of_year`, `days_since_start`, `semester_idx`), convierte columnas numéricas con `pd.to_numeric(..., errors="coerce")` para manejar valores `None` sin errores de dtype, y devuelve P25, P75 y media en CLP. Los modelos se cargan una sola vez al iniciar la aplicación.
-
-### `agents/ficha_agent.py`
-Gestiona el estado de la sesión y la conversación con el LLM. Extrae y estructura los atributos de la ficha técnica a partir del lenguaje natural. Los atributos marcados como `COMPLEMENT_ONLY` (e.g., `linea_procesador`, `generacion_procesador`) son derivados automáticamente por regex desde `procesador_principal` y nunca son solicitados directamente al usuario.
-
----
-
-## Modelo de datos — tabla `PrecioCA`
-
-Cada fila representa una orden de compra real del catálogo Compra Ágil.
-
-```mermaid
-erDiagram
-    PrecioCA {
-        text tipo_equipo "Laptop / AIO / Desktop / Otro"
-        text procesador_principal "Nombre completo del procesador"
-        text linea_procesador "Core i5 / Ryzen 7 / Apple M2..."
-        text generacion_procesador "13th Gen / Zen 4 / M2..."
-        integer nucleos_procesador
-        integer hilos_procesador
-        numeric total_ram_gb "8 / 16 / 32 GB"
-        text tecnologia_ram "DDR5 / DDR4 / LPDDR5X / LPDDR4..."
-        numeric total_almacenamiento_gb "256 / 512 / 1024 GB"
-        text tecnologia_disco_principal "NVMe SSD / SATA SSD / HDD / eMMC"
-        text tipo_configuracion_discos "solo SSD / SSD+HDD / solo HDD"
-        boolean tiene_gpu_dedicada
-        text marca "HP / Dell / Lenovo / Apple..."
-        text sistema_operativo "Windows 11 / macOS / Linux..."
-        numeric precio_unitario "Precio neto en CLP"
-        numeric precio_unitario_iva "Precio con IVA en CLP"
-        boolean es_accesorio "Se excluyen accesorios de las consultas"
-    }
-```
-
----
-
-## Lógica de estimación de precios
+## Diagrama del sistema
 
 ```mermaid
 flowchart TD
-    A["Ficha técnica del usuario"] --> B["Query inicial\ncon todos los atributos disponibles"]
-    B --> C{"¿≥ 5 registros\ncoincidentes?"}
-    C -->|Sí| D["✅ Retorna distribución\nde precios históricos"]
-    C -->|No| E["LLM elige qué atributos\nrelajar según jerarquía"]
-    E --> F{"¿Combinación válida\ny no repetida?"}
-    F -->|No| G["❌ price_not_found"]
-    F -->|Sí| H{"¿Iteración < 6?"}
-    H -->|No| G
-    H -->|Sí| B
+    subgraph Cliente["Navegador (usuario)"]
+        UI["Interfaz web\nChat + Ficha técnica"]
+    end
 
+    subgraph Railway["Infraestructura Railway"]
+        FE["Frontend\nFlask :5000\nProxy + SSR"]
+        BE["Backend\nFastAPI :8000"]
+        DB[("PostgreSQL\nPrecioCA\nmetricas")]
+    end
+
+    subgraph IA["Servicios externos"]
+        GPT["OpenAI\nGPT-4o-mini"]
+    end
+
+    subgraph Local["Archivos locales (backend)"]
+        FAISS["Índices FAISS\n(embeddings)"]
+        CSV["Diccionarios CSV\ndictionary · complement"]
+    end
+
+    UI -- "HTTP POST /api/chat" --> FE
+    FE -- "Proxy + x-api-key" --> BE
+    BE -- "SSE stream" --> FE
+    FE -- "SSE stream" --> UI
+
+    BE -- "Chat completion\nstreaming" --> GPT
+    BE -- "Normalización\nsemántica" --> FAISS
+    FAISS -- "Lee" --> CSV
+    BE -- "Consulta precios\nPERCENTILE_CONT" --> DB
+    BE -- "Analytics\nfire-and-forget" --> DB
 ```
-
-**Jerarquía de especificidad del procesador:**
-
-`procesador_principal` → `linea_procesador + generacion_procesador` → `nucleos_procesador` → _(sin procesador)_
 
 ---
 
-## Variables de entorno
+## Flujo de una interacción
 
-```env
-OPENAI_API_KEY=           # API key de OpenAI
-OPENAI_MODEL=gpt-4o-mini  # Modelo LLM
-EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
-DATABASE_URL=             # Connection string PostgreSQL (interno Railway)
-FRONTEND_API_KEY=         # Clave compartida con el frontend para autenticación
-ALLOWED_ORIGINS=          # URL pública del frontend (CORS)
-FAISS_CACHE_DIR=./cache/faiss_dict
-TEMPERATURE=0.2
-SIMILARITY_THRESHOLD=0.82
-PORT=8000
+```mermaid
+sequenceDiagram
+    actor U as Usuario
+    participant FE as Frontend (Flask)
+    participant GR as GuardrailService
+    participant AG as FichaAgent (GPT-4o-mini)
+    participant FM as AttributeMatcher (FAISS)
+    participant PS as PriceService (PostgreSQL)
+    participant AN as AnalyticsService
+
+    U->>FE: mensaje en chat
+    FE->>GR: POST /api/chat/{session_id}
+    GR-->>FE: allowed / blocked / clean_message
+
+    alt Mensaje válido
+        FE->>AG: stream_process_message()
+        AG-->>FE: SSE: thinking
+        AG-->>FE: SSE: assistant_chunk (streaming)
+        AG->>FM: normalize(categoria, atributo, valor)
+        FM-->>AG: valor canónico + score
+        AG->>FM: get_complements(atributo, valor)
+        FM-->>AG: atributos derivados
+        AG-->>FE: SSE: ficha_update + complement_update
+        AG-->>FE: SSE: questions
+        FE->>PS: estimate(ficha)
+        PS-->>FE: SSE: price_update (P25/P50/P75)
+        FE->>AN: log(evento) [async]
+        FE-->>U: SSE: [DONE]
+    else Mensaje bloqueado
+        FE-->>U: SSE: blocked + razón
+    end
 ```
 
 ---
 
-## Ejecución local
+## Versión y despliegue
+
+| Campo | Valor |
+|---|---|
+| Versión | `v1.0.0` |
+| Tag git | `v1.0.0` en ambos repos (backend y frontend) |
+| Commit de referencia | `05f0598` |
+| Primer deploy Railway | 15 mayo 2026, 12:15 PM GMT-4 |
+| Infraestructura | Railway — 3 servicios: backend, frontend, PostgreSQL |
+| Categoría cubierta | Computadores (Laptops, Desktops, AIO, Workstations) |
+
+---
+
+## Lógica de estimación de precio
+
+El precio estimado que se muestra al comprador se calcula directamente sobre **transacciones históricas reales de Compra Ágil** (Órdenes de Compra adjudicadas), almacenadas en la tabla `PrecioCA` de PostgreSQL.
+
+### Regla de cálculo
+
+```sql
+SELECT
+    COUNT(*)                                                              AS n,
+    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY precio_unitario::numeric) AS p25,
+    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY precio_unitario::numeric) AS mediana,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY precio_unitario::numeric) AS p75,
+    -- mismo cálculo para precio_unitario_iva
+FROM "PrecioCA"
+WHERE
+    LOWER(COALESCE(es_accesorio::text, 'false')) != 'true'   -- excluye accesorios
+    AND precio_unitario::numeric > 200000                     -- mínimo $200.000 CLP
+    AND precio_unitario::numeric < 5000000                    -- máximo $5.000.000 CLP
+    AND [filtros dinámicos por atributos de la ficha]
+```
+
+### Filtros dinámicos
+
+Los atributos completados en la ficha se usan como filtros `WHERE` simultáneos:
+
+- **Valor único:** `columna ILIKE '%valor%'`
+- **Lista de alternativas:** `(columna ILIKE '%v1%' OR columna ILIKE '%v2%')`
+- **Rango numérico:** `SPLIT_PART(columna, ' ', 1)::numeric BETWEEN min AND max`
+- **GPU dedicada:** `tiene_gpu_dedicada = 'true'/'false'`
+
+### Resultado devuelto
+
+El sistema entrega **P25, mediana y P75** tanto en precio neto como con IVA, en CLP. Se muestra una advertencia si el universo de registros supera 1.000 (búsqueda demasiado genérica).
+
+
+---
+
+## Ejemplo: input → output
+
+### Modo conversacional
+
+**Entrada (turno 1):**
+```
+Usuario: "Necesito laptops para la oficina de administración, trabajan con Excel con macros y SAP"
+```
+
+**Salida (stream SSE):**
+```
+data: {"type": "thinking"}
+
+data: {"type": "assistant_chunk", "delta": "Para un uso con SAP y Excel con macros, recomiendo al menos 16 GB de RAM y un procesador de línea Core i5 o Ryzen 5."}
+
+data: {"type": "assistant_done"}
+
+data: {"type": "ficha_update", "updates": [
+  {"attribute": "tipo_equipo",                "value": "Laptop",                       "source": "ai",   "normalized": true,  "score": 1.0},
+  {"attribute": "linea_procesador",           "value": "Intel Core i5",               "source": "ai",   "normalized": false, "score": 1.0},
+  {"attribute": "total_ram_gb",               "value": 16,                             "source": "ai",   "normalized": false, "score": 1.0},
+  {"attribute": "tecnologia_ram",             "value": "DDR4",                         "source": "ai",   "normalized": false, "score": 1.0},
+  {"attribute": "total_almacenamiento_gb",    "value": 512,                            "source": "ai",   "normalized": false, "score": 1.0},
+  {"attribute": "tecnologia_disco_principal", "value": "NVMe SSD",                    "source": "ai",   "normalized": false, "score": 1.0},
+  {"attribute": "tipo_configuracion_discos",  "value": "solo SSD",                    "source": "ai",   "normalized": false, "score": 1.0},
+  {"attribute": "tiene_gpu_dedicada",         "value": false,                          "source": "ai",   "normalized": false, "score": 1.0},
+  {"attribute": "sistema_operativo",          "value": "Microsoft Windows 11 Pro",    "source": "ai",   "normalized": true,  "score": 0.96}
+]}
+
+data: {"type": "ficha_update", "updates": [
+  {"attribute": "frecuencia_ram_mhz",  "value": "3200", "source": "complement", "triggered_by": "tecnologia_ram",  "triggered_value": "DDR4"}
+]}
+
+data: {"type": "price_update", "data": {
+  "count": 94,
+  "p25": 412000,   "median": 489000,   "p75": 567000,
+  "p25_iva": 490280, "median_iva": 581910, "p75_iva": 674730,
+  "currency": "CLP",
+  "match_attrs": ["tipo_equipo","linea_procesador","total_ram_gb","tecnologia_ram","total_almacenamiento_gb","tiene_gpu_dedicada","sistema_operativo"],
+  "match_description": "tipo, línea proc., RAM, tecnología RAM, almacenamiento, GPU dedicada, SO"
+}}
+
+data: [DONE]
+```
+
+---
+
+### Modo descripción técnica
+
+**Entrada:**
+```
+Usuario: "HP Laptop 15s-eq3023la, AMD Ryzen 5 5500U, 8GB DDR4 3200MHz, 512GB SSD NVMe, Windows 11 Home"
+```
+
+**Salida (ficha_update relevante):**
+```json
+[
+  {"attribute": "tipo_equipo",                "value": "Laptop",                        "source": "ai",        "normalized": true,  "score": 1.0},
+  {"attribute": "marca",                      "value": "HP",                            "source": "ai",        "normalized": true,  "score": 0.99},
+  {"attribute": "procesador_principal",       "value": "AMD Ryzen 5 5500U",            "source": "ai",        "normalized": true,  "score": 0.91},
+  {"attribute": "total_ram_gb",               "value": 8,                               "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "tecnologia_ram",             "value": "DDR4",                          "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "total_almacenamiento_gb",    "value": 512,                             "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "tecnologia_disco_principal", "value": "NVMe SSD",                     "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "tipo_configuracion_discos",  "value": "solo SSD",                     "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "tiene_gpu_dedicada",         "value": false,                           "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "sistema_operativo",          "value": "Microsoft Windows 11 Home",    "source": "ai",        "normalized": true,  "score": 0.97},
+  {"attribute": "nucleos_procesador",         "value": "6",                             "source": "complement","triggered_by": "procesador_principal"},
+  {"attribute": "hilos_procesador",           "value": "12",                            "source": "complement","triggered_by": "procesador_principal"},
+  {"attribute": "frecuencia_turbo_procesador_mhz", "value": "4200",                   "source": "complement","triggered_by": "procesador_principal"},
+  {"attribute": "generacion_procesador",      "value": "5ta Generación",               "source": "complement","triggered_by": "procesador_principal"},
+  {"attribute": "linea_procesador",           "value": "AMD Ryzen 5",                  "source": "complement","triggered_by": "procesador_principal"},
+  {"attribute": "frecuencia_ram_mhz",         "value": "3200",                         "source": "complement","triggered_by": "tecnologia_ram"}
+]
+```
+
+---
+
+## Configuración rápida
 
 ```bash
-cd MVP1-AIChileCompra-backend
-python -m venv venv
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # macOS / Linux
-pip install -r requirements.txt
+# 1. Clonar ambos repos
+git clone https://github.com/eduardomoyab/MVP1-AIChileCompra-backend.git
+git clone https://github.com/eduardomoyab/MVP1-AIChileCompra-frontend.git
 
-# Crear .env con las variables requeridas
-uvicorn main:app --reload --port 8000
+# 2. Backend
+cd MVP1-AIChileCompra-backend
+cp .env.example .env          # completar variables
+python -m venv venv && venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+
+# 3. Frontend (otra terminal)
+cd ../MVP1-AIChileCompra-frontend
+cp .env.example .env          # completar API_URL y FRONTEND_API_KEY
+python -m venv venv && venv\Scripts\activate
+pip install -r requirements.txt
+python app.py
 ```
 
-## Despliegue (Railway)
-
-Railway detecta el `Dockerfile` automáticamente. Las variables de entorno se configuran en **Railway → Backend service → Variables**. El servicio no necesita dominio público habilitado: opera exclusivamente dentro de la red privada interna de Railway.
+> Documentación detallada: [`README_backend.md`](https://github.com/eduardomoyab/MVP1-AIChileCompra-backend/blob/main/README_backend.md) · [`README_frontend.md`](https://github.com/eduardomoyab/MVP1-AIChileCompra-frontend/blob/main/README_frontend.md)
