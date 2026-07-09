@@ -231,6 +231,94 @@ Usuario: "HP Laptop 15s-eq3023la, AMD Ryzen 5 5500U, 8GB DDR4 3200MHz, 512GB SSD
 
 ---
 
+### Edición manual de atributo
+
+El usuario edita un campo directamente en la ficha. El backend recalcula complementos y re-estima el precio.
+
+**Entrada — `POST /api/manual_update/{session_id}`:**
+```json
+{"attribute": "total_ram_gb", "value": 32}
+```
+
+**Salida (stream SSE):**
+```
+data: {"type": "ficha_update", "updates": [
+  {"attribute": "total_ram_gb", "value": 32, "source": "user", "normalized": false, "score": 1.0}
+]}
+
+data: {"type": "price_update", "data": {
+  "count": 18,
+  "p25": 561000,      "median": 648000,     "p75": 742000,
+  "p25_iva": 667590,  "median_iva": 771120, "p75_iva": 869980,
+  "currency": "CLP",
+  "match_attrs": ["tipo_equipo","linea_procesador","total_ram_gb","tecnologia_ram","total_almacenamiento_gb","tiene_gpu_dedicada","sistema_operativo"],
+  "match_description": "tipo, línea proc., RAM, tecnología RAM, almacenamiento, GPU dedicada, SO",
+  "broad_warning": false
+}}
+
+data: [DONE]
+```
+
+---
+
+### Transacciones históricas
+
+**Entrada — `GET /api/offers/{session_id}`** (sin body, usa la ficha de la sesión activa)
+
+**Salida (hasta 30 OC reales adjudicadas en Compra Ágil, filtradas dentro del rango P25–P75):**
+```json
+{
+  "offers": [
+    {
+      "codigo_requerimiento": "XXXX-1-COT24",
+      "precio_unitario":      489000,
+      "precio_unitario_iva":  581910,
+      "descripcion":          "Laptop Intel Core i5-1235U, 16GB DDR4, 512GB NVMe SSD, Windows 11 Pro",
+      "fecha_modificacion":   "2024-03-12",
+      "id_oferta_aquiles":    9000001,
+      "codigo_oc":            "XXXX-1-AG24",
+      "razon_social":         "Proveedor A SpA",
+      "oc_codes":             ["XXXX-1-AG24"],
+      "oc_urls":              ["https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx?CodigoOC=XXXX-1-AG24"],
+      "ca_url":               "https://buscador.mercadopublico.cl/ficha?code=XXXX-1-COT24",
+      "ca_available":         true
+    },
+    {
+      "codigo_requerimiento": "XXXX-2-COT23",
+      "precio_unitario":      462000,
+      "precio_unitario_iva":  549780,
+      "descripcion":          "Notebook Core i5 11va Gen, RAM 16GB, Disco SSD 512GB, SO Win 11 Pro",
+      "fecha_modificacion":   "2023-11-08",
+      "id_oferta_aquiles":    9000002,
+      "codigo_oc":            "XXXX-2-AG23",
+      "razon_social":         "Proveedor B Ltda.",
+      "oc_codes":             ["XXXX-2-AG23"],
+      "oc_urls":              ["https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx?CodigoOC=XXXX-2-AG23"],
+      "ca_url":               "https://buscador.mercadopublico.cl/ficha?code=XXXX-2-COT23",
+      "ca_available":         true
+    },
+    {
+      "codigo_requerimiento": "XXXX-3-COT23",
+      "precio_unitario":      531000,
+      "precio_unitario_iva":  631890,
+      "descripcion":          "Laptop i5 12th Gen 16GB RAM 512GB SSD NVMe W11Pro",
+      "fecha_modificacion":   "2023-09-21",
+      "id_oferta_aquiles":    9000003,
+      "codigo_oc":            "XXXX-3-AG23",
+      "razon_social":         "Proveedor C S.A.",
+      "oc_codes":             ["XXXX-3-AG23"],
+      "oc_urls":              ["https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx?CodigoOC=XXXX-3-AG23"],
+      "ca_url":               "https://buscador.mercadopublico.cl/ficha?code=XXXX-3-COT23",
+      "ca_available":         true
+    }
+  ]
+}
+```
+
+> `oc_urls` y `ca_url` son links directos a Mercado Público. `razon_social` es el proveedor adjudicado en esa OC.
+
+---
+
 ## Configuración rápida
 
 ```bash
