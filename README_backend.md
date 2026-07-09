@@ -212,6 +212,94 @@ data: [DONE]
 
 > El evento `price_update` se emite en el mismo stream SSE, después de los atributos. Los precios provienen de OC históricas de Compra Ágil filtradas por los atributos de la ficha (ver sección SQL más abajo).
 
+### Edición manual de atributo — `POST /api/manual_update/{session_id}`
+
+El usuario edita un campo directamente en la ficha (sin pasar por el chat). El backend aplica la normalización FAISS, recalcula complementos y re-estima el precio.
+
+**Body:**
+```json
+{"attribute": "total_ram_gb", "value": 32}
+```
+
+**Stream SSE de respuesta:**
+```
+data: {"type": "ficha_update", "updates": [
+  {"attribute": "total_ram_gb", "value": 32, "source": "user", "normalized": false, "score": 1.0}
+]}
+
+data: {"type": "price_update", "data": {
+  "count": 18,
+  "p25": 561000,      "median": 648000,     "p75": 742000,
+  "p25_iva": 667590,  "median_iva": 771120, "p75_iva": 869980,
+  "currency": "CLP",
+  "match_attrs": ["tipo_equipo","linea_procesador","total_ram_gb","tecnologia_ram","total_almacenamiento_gb","tiene_gpu_dedicada","sistema_operativo"],
+  "match_description": "tipo, línea proc., RAM, tecnología RAM, almacenamiento, GPU dedicada, SO",
+  "broad_warning": false
+}}
+
+data: [DONE]
+```
+
+> Si el atributo editado tiene complementos definidos en `attribute_complement.csv`, el SSE incluye un segundo evento `ficha_update` con los atributos derivados actualizados (p. ej., editar `tecnologia_ram` recalcula `frecuencia_ram_mhz`).
+
+---
+
+### Transacciones históricas — `GET /api/offers/{session_id}`
+
+Llamada separada (no SSE) que devuelve hasta 30 OC reales adjudicadas en Compra Ágil que coinciden con la ficha actual, filtradas dentro del rango P25–P75. Incluye link directo a Mercado Público por cada transacción.
+
+**Respuesta (fragmento con 3 registros):**
+```json
+{
+  "offers": [
+    {
+      "codigo_requerimiento": "1058095-5-CM24",
+      "precio_unitario":      489000,
+      "precio_unitario_iva":  581910,
+      "descripcion":          "Laptop Intel Core i5-1235U, 16GB DDR4, 512GB NVMe SSD, Windows 11 Pro",
+      "fecha_modificacion":   "2024-03-12",
+      "id_oferta_aquiles":    2381045,
+      "codigo_oc":            "1058095-28-AG24",
+      "razon_social":         "Distribuidora Tecnológica Del Centro SpA",
+      "oc_codes":             ["1058095-28-AG24"],
+      "oc_urls":              ["https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx?CodigoOC=1058095-28-AG24"],
+      "ca_url":               "https://buscador.mercadopublico.cl/ficha?code=1058095-5-CM24",
+      "ca_available":         true
+    },
+    {
+      "codigo_requerimiento": "2744-449-COT23",
+      "precio_unitario":      462000,
+      "precio_unitario_iva":  549780,
+      "descripcion":          "Notebook Core i5 11va Gen, RAM 16GB, Disco SSD 512GB, SO Win 11 Pro",
+      "fecha_modificacion":   "2023-11-08",
+      "id_oferta_aquiles":    2197834,
+      "codigo_oc":            "2744-578-AG23",
+      "razon_social":         "Comercial Informática Austral Ltda.",
+      "oc_codes":             ["2744-578-AG23"],
+      "oc_urls":              ["https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx?CodigoOC=2744-578-AG23"],
+      "ca_url":               "https://buscador.mercadopublico.cl/ficha?code=2744-449-COT23",
+      "ca_available":         true
+    },
+    {
+      "codigo_requerimiento": "3606-108-COT23",
+      "precio_unitario":      531000,
+      "precio_unitario_iva":  631890,
+      "descripcion":          "Laptop i5 12th Gen 16GB RAM 512GB SSD NVMe W11Pro",
+      "fecha_modificacion":   "2023-09-21",
+      "id_oferta_aquiles":    2104562,
+      "codigo_oc":            "3606-201-AG23",
+      "razon_social":         "Soluciones Computacionales Norte S.A.",
+      "oc_codes":             ["3606-201-AG23"],
+      "oc_urls":              ["https://www.mercadopublico.cl/PurchaseOrder/Modules/PO/DetailsPurchaseOrder.aspx?CodigoOC=3606-201-AG23"],
+      "ca_url":               "https://buscador.mercadopublico.cl/ficha?code=3606-108-COT23",
+      "ca_available":         true
+    }
+  ]
+}
+```
+
+> Los campos `oc_urls` y `ca_url` son links directos a Mercado Público. El frontend los usa para que el comprador pueda revisar cada OC original. `razon_social` es el proveedor adjudicado en esa transacción.
+
 ---
 
 ## Normalización semántica (FAISS)
