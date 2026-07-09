@@ -13,7 +13,7 @@ API REST con streaming SSE construida en **FastAPI**. Contiene toda la lógica d
 | Framework API | FastAPI 0.115+ + Uvicorn |
 | LLM principal | OpenAI GPT-4o-mini |
 | LLM guardrail | OpenAI GPT-4o-mini (temperatura 0, fijo) |
-| Búsqueda semántica | FAISS (`IndexFlatIP`) + sentence-transformers |
+| Búsqueda semántica | FAISS (`IndexFlatIP`) + OpenAI `text-embedding-3-small` (nube) / sentence-transformers (local) |
 | Estimación de precios | PostgreSQL · `PERCENTILE_CONT` sobre tabla `PrecioCA` |
 | Base de datos | PostgreSQL (Railway Managed) |
 | ORM / queries | SQLAlchemy 2.0 Core |
@@ -164,12 +164,62 @@ WHERE
 
 ---
 
+## Ejemplo: input → output
+
+**Endpoint:** `POST /api/chat/{session_id}`  
+**Header:** `x-api-key: <FRONTEND_API_KEY>`  
+**Body:**
+```json
+{"message": "Necesito laptops para la oficina, trabajan con Excel con macros y SAP"}
+```
+
+**Stream SSE de respuesta:**
+```
+data: {"type": "thinking"}
+
+data: {"type": "assistant_chunk", "delta": "Para SAP y Excel con macros recomiendo al menos 16 GB RAM y procesador Core i5 o Ryzen 5."}
+
+data: {"type": "assistant_done"}
+
+data: {"type": "ficha_update", "updates": [
+  {"attribute": "tipo_equipo",                "value": "Laptop",                    "source": "ai",        "normalized": true,  "score": 1.0},
+  {"attribute": "linea_procesador",           "value": "Intel Core i5",            "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "total_ram_gb",               "value": 16,                          "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "tecnologia_ram",             "value": "DDR4",                      "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "total_almacenamiento_gb",    "value": 512,                         "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "tecnologia_disco_principal", "value": "NVMe SSD",                 "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "tipo_configuracion_discos",  "value": "solo SSD",                 "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "tiene_gpu_dedicada",         "value": false,                       "source": "ai",        "normalized": false, "score": 1.0},
+  {"attribute": "sistema_operativo",          "value": "Microsoft Windows 11 Pro", "source": "ai",        "normalized": true,  "score": 0.96},
+  {"attribute": "frecuencia_ram_mhz",         "value": "3200",                     "source": "complement","triggered_by": "tecnologia_ram"}
+]}
+
+data: {"type": "questions", "questions": ["¿Cuántas unidades necesita?", "¿Requiere pantalla táctil?"]}
+
+data: {"type": "price_update", "data": {
+  "count": 94,
+  "p25": 412000,      "median": 489000,     "p75": 567000,
+  "p25_iva": 490280,  "median_iva": 581910, "p75_iva": 674730,
+  "min": 298000,      "max": 890000,
+  "currency": "CLP",
+  "match_attrs": ["tipo_equipo","linea_procesador","total_ram_gb","tecnologia_ram","total_almacenamiento_gb","tiene_gpu_dedicada","sistema_operativo"],
+  "match_description": "tipo, línea proc., RAM, tecnología RAM, almacenamiento, GPU dedicada, SO",
+  "broad_warning": false
+}}
+
+data: [DONE]
+```
+
+> El evento `price_update` se emite en el mismo stream SSE, después de los atributos. Los precios provienen de OC históricas de Compra Ágil filtradas por los atributos de la ficha (ver sección SQL más abajo).
+
+---
+
 ## Normalización semántica (FAISS)
 
 ```mermaid
 flowchart LR
     IN["Valor en texto libre\nej: 'hp victus'"]
-    EMB["Embedding\nparaphrase-multilingual\nMiniLM-L12-v2"]
+    EMB["Embedding\nOpenAI text-embedding-3-small\n(en la nube) o MiniLM (local)"]
     IDX["Índice FAISS\nIndexFlatIP\npor categoria+atributo"]
     TOP["Top-3 candidatos\npor similitud coseno"]
     THR{"score ≥\nSIMILARITY_THRESHOLD\n(default 0.82)?"}
@@ -196,8 +246,8 @@ Los índices se construyen al inicio (background thread) y se persisten en `FAIS
 | `DATABASE_URL` | — | **Sí** | URL PostgreSQL (`postgresql://user:pass@host:port/db`) |
 | `FRONTEND_API_KEY` | — | **Sí** | Clave compartida con el frontend para autenticar peticiones |
 | `ALLOWED_ORIGINS` | `http://localhost:5000` | No | Orígenes CORS (URL pública del frontend) |
-| `EMBEDDING_PROVIDER` | `local` | No | `local` (sentence-transformers, ~500 MB RAM) u `openai` (API) |
-| `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | No | Modelo de embeddings (solo si `EMBEDDING_PROVIDER=local`) |
+| `EMBEDDING_PROVIDER` | `local` | No | `openai` (en la nube) o `local` (sentence-transformers, ~500 MB RAM) |
+| `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | No | `text-embedding-3-small` con `openai`, o nombre de modelo HuggingFace con `local` |
 | `SIMILARITY_THRESHOLD` | `0.82` | No | Umbral mínimo FAISS para aceptar normalización (0.0–1.0) |
 | `BROAD_SEARCH_THRESHOLD` | `1000` | No | Registros a partir de los cuales se marca `broad_warning` |
 | `FAISS_CACHE_DIR` | `./cache/faiss_dict` | No | Directorio para persistir índices FAISS entre reinicios |
@@ -224,4 +274,5 @@ python main.py
 # → http://localhost:8000/health
 ```
 
-> Para entornos con poca RAM: usar `EMBEDDING_PROVIDER=openai` y comentar `sentence-transformers` en `requirements.txt`.
+> **En la nube (Railway):** `EMBEDDING_PROVIDER=openai` + `EMBEDDING_MODEL=text-embedding-3-small` — sin dependencia local, usa la misma clave `OPENAI_API_KEY`.  
+> **Local:** `EMBEDDING_PROVIDER=local` + `EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2` — descarga el modelo (~500 MB RAM) al primer arranque.

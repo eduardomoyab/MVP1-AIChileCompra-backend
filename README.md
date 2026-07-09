@@ -153,7 +153,7 @@ El sistema entrega **P25, mediana y P75** tanto en precio neto como con IVA, en 
 
 ---
 
-## Ejemplo anonimizado: input → output
+## Ejemplo: input → output
 
 ### Modo conversacional
 
@@ -200,7 +200,7 @@ data: [DONE]
 
 ---
 
-### Modo descripción técnica (extracción directa)
+### Modo descripción técnica
 
 **Entrada:**
 ```
