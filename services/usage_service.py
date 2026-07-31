@@ -9,6 +9,7 @@ usuario, no el de la máquina donde corre esto.
 """
 
 import os
+import time
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -17,6 +18,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
+from services import access_service
+
 load_dotenv()
 
 _DB_URL = os.getenv("DATABASE_URL")
@@ -24,6 +27,13 @@ _TZ = ZoneInfo("America/Santiago")
 DAILY_TOKEN_LIMIT = int(os.getenv("DAILY_TOKEN_LIMIT", "100000"))
 
 _engine = None
+
+# Tope por persona configurado en panel_admin.application_users (ver
+# access_service.get_daily_limit) — se cachea unos minutos para no
+# consultar esa tabla en cada mensaje de chat, solo cambia cuando un
+# admin edita el límite desde db-admin-panel.
+_LIMIT_CACHE_TTL = 300  # 5 min
+_limit_cache: dict = {}
 
 
 def _get_engine():
@@ -66,6 +76,27 @@ def _next_reset_utc() -> datetime:
     return next_midnight_cl.astimezone(ZoneInfo("UTC"))
 
 
+def _resolve_limit(email: str) -> Optional[int]:
+    """None = sin límite para esta persona. Prioridad: valor propio en
+    application_users (0=ilimitado, N=tope propio) sobre DAILY_TOKEN_LIMIT
+    global, que solo aplica cuando esa fila no tiene nada asignado (NULL)."""
+    now = time.monotonic()
+    cached = _limit_cache.get(email)
+    if cached and (now - cached[1]) < _LIMIT_CACHE_TTL:
+        return cached[0]
+
+    custom = access_service.get_daily_limit(email)
+    if custom is None:
+        resolved = DAILY_TOKEN_LIMIT
+    elif custom == 0:
+        resolved = None  # ilimitado
+    else:
+        resolved = custom
+
+    _limit_cache[email] = (resolved, now)
+    return resolved
+
+
 def get_usage(email: str) -> dict:
     tokens_used = 0
     engine = _get_engine()
@@ -80,15 +111,26 @@ def get_usage(email: str) -> dict:
         except Exception as e:
             logging.warning(f"[usage] Error leyendo uso diario de '{email}': {e}")
 
-    remaining = max(DAILY_TOKEN_LIMIT - tokens_used, 0)
-    percent = round(min(tokens_used / DAILY_TOKEN_LIMIT * 100, 100), 1) if DAILY_TOKEN_LIMIT else 0.0
+    limit = _resolve_limit(email)
+    if limit is None:
+        return {
+            "tokens_used": tokens_used,
+            "daily_limit": None,
+            "remaining": None,
+            "percent_used": 0.0,
+            "resets_at": _next_reset_utc().isoformat(),
+            "blocked": False,
+        }
+
+    remaining = max(limit - tokens_used, 0)
+    percent = round(min(tokens_used / limit * 100, 100), 1)
     return {
         "tokens_used": tokens_used,
-        "daily_limit": DAILY_TOKEN_LIMIT,
+        "daily_limit": limit,
         "remaining": remaining,
         "percent_used": percent,
         "resets_at": _next_reset_utc().isoformat(),
-        "blocked": tokens_used >= DAILY_TOKEN_LIMIT,
+        "blocked": tokens_used >= limit,
     }
 
 

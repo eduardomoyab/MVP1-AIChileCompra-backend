@@ -10,6 +10,7 @@ vía GET /api/auth/check_access en vez de conectarse él mismo a la base.
 
 import os
 import logging
+from typing import Optional
 
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -49,3 +50,30 @@ def is_email_allowed(email: str) -> bool:
     except Exception as e:
         logging.warning(f"[access] Error consultando lista blanca de acceso: {e}")
         return False
+
+
+def get_daily_limit(email: str) -> Optional[int]:
+    """Tope diario de tokens configurado para este correo en
+    panel_admin.application_users, administrado desde "Aplicaciones" en
+    db-admin-panel. Convención de la columna: None = fila sin valor propio
+    (usa el default global) o correo no encontrado; 0 = ilimitado; N =
+    tope propio de esa persona."""
+    engine = _get_engine()
+    if not engine or not email:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT au.daily_token_limit FROM panel_admin.application_users au
+                    JOIN panel_admin.applications a ON a.id = au.application_id
+                    WHERE a.slug = :slug AND au.email = :email
+                    """
+                ),
+                {"slug": _APPLICATION_SLUG, "email": email.strip().lower()},
+            ).fetchone()
+            return row[0] if row else None
+    except Exception as e:
+        logging.warning(f"[access] Error consultando límite diario de '{email}': {e}")
+        return None
