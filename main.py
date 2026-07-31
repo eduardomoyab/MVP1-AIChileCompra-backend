@@ -33,6 +33,7 @@ from services import currency_service
 from services.lgbm_price_service import LgbmPriceService
 from services.guardrail_service import GuardrailService
 from services import analytics_service
+from services import access_service
 
 load_dotenv()
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -126,6 +127,14 @@ class ManualUpdateRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "Asistente Compra Ágil"}
+
+
+# ─── Acceso (whitelist consultada por el frontend en el login) ────────────────
+
+@app.get("/api/auth/check_access")
+async def check_access_endpoint(email: str, _: str = Depends(require_api_key)):
+    allowed = await asyncio.to_thread(access_service.is_email_allowed, email)
+    return {"allowed": allowed}
 
 
 # ─── Schema ───────────────────────────────────────────────────────────────────

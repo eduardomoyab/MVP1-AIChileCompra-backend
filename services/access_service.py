@@ -1,0 +1,51 @@
+"""
+access_service.py
+
+Consulta la lista blanca de acceso a MVP1 (panel_admin.application_users),
+administrada desde el módulo "Aplicaciones" de db-admin-panel — mismo
+Postgres, no hay API entre ambos paneles. El backend es la única pieza de
+MVP1 con credenciales de Postgres; el frontend le pregunta a este servicio
+vía GET /api/auth/check_access en vez de conectarse él mismo a la base.
+"""
+
+import os
+import logging
+
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_DB_URL = os.getenv("DATABASE_URL")
+_APPLICATION_SLUG = "mvp1-compra-agil"
+
+_engine = None
+
+
+def _get_engine():
+    global _engine
+    if _engine is None and _DB_URL:
+        _engine = create_engine(_DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
+    return _engine
+
+
+def is_email_allowed(email: str) -> bool:
+    engine = _get_engine()
+    if not engine or not email:
+        return False
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT 1 FROM panel_admin.application_users au
+                    JOIN panel_admin.applications a ON a.id = au.application_id
+                    WHERE a.slug = :slug AND au.email = :email
+                    """
+                ),
+                {"slug": _APPLICATION_SLUG, "email": email.strip().lower()},
+            ).fetchone()
+            return row is not None
+    except Exception as e:
+        logging.warning(f"[access] Error consultando lista blanca de acceso: {e}")
+        return False
