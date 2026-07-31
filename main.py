@@ -28,6 +28,8 @@ from dotenv import load_dotenv
 from agents.attribute_matcher import AttributeMatcher
 from agents.ficha_agent import FichaAgent, FILLABLE_ATTRIBUTES
 from services.price_service import PriceService
+from services.cm_service import CMService
+from services import currency_service
 from services.lgbm_price_service import LgbmPriceService
 from services.guardrail_service import GuardrailService
 from services import analytics_service
@@ -42,6 +44,7 @@ logging.basicConfig(
 
 matcher = AttributeMatcher()
 price_service = PriceService()
+cm_service = CMService()
 lgbm_service = LgbmPriceService()
 guardrail = GuardrailService()
 agent: FichaAgent = None
@@ -52,6 +55,7 @@ _HISTORY_MAX = 20
 
 # Caché del último estimate por sesión para evitar re-query en /api/offers
 _session_price_cache: dict[str, dict] = {}
+_session_cm_price_cache: dict[str, dict] = {}
 
 # ─── API Key ──────────────────────────────────────────────────────────────────
 
@@ -74,6 +78,8 @@ async def lifespan(app: FastAPI):
     logging.info("Servidor listo — construyendo índices FAISS y dropdowns en background...")
     asyncio.create_task(asyncio.to_thread(matcher.warm))
     asyncio.create_task(asyncio.to_thread(price_service.warmup_dropdowns))
+    asyncio.create_task(asyncio.to_thread(cm_service.warmup))
+    asyncio.create_task(asyncio.to_thread(currency_service.warmup))
     yield
     logging.info("Servidor apagado")
 
@@ -236,6 +242,18 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
 
+                try:
+                    cm_price = await asyncio.to_thread(cm_service.estimate, ficha)
+                    if cm_price:
+                        _session_cm_price_cache[session_id] = cm_price
+                        yield sse({"type": "cm_price_update", "data": cm_price})
+                    else:
+                        _session_cm_price_cache.pop(session_id, None)
+                        yield sse({"type": "cm_price_not_found"})
+                except Exception as e:
+                    logging.warning(f"Error en estimación de precio Convenio Marco: {e}")
+                    yield sse({"type": "cm_price_not_found"})
+
             yield "data: [DONE]\n\n"
 
             usage = result.get("tokens")
@@ -299,6 +317,18 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
                     logging.warning(f"Error en estimación de precio: {e}")
                     yield sse({"type": "price_not_found"})
 
+                try:
+                    cm_price = await asyncio.to_thread(cm_service.estimate, ficha)
+                    if cm_price:
+                        _session_cm_price_cache[session_id] = cm_price
+                        yield sse({"type": "cm_price_update", "data": cm_price})
+                    else:
+                        _session_cm_price_cache.pop(session_id, None)
+                        yield sse({"type": "cm_price_not_found"})
+                except Exception as e:
+                    logging.warning(f"Error en estimación de precio Convenio Marco: {e}")
+                    yield sse({"type": "cm_price_not_found"})
+
             yield "data: [DONE]\n\n"
 
             analytics_service.log(
@@ -356,6 +386,17 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
     return {"offers": _enrich_offers(rows)}
 
 
+@app.get("/api/cm_offers/{session_id}")
+async def get_cm_offers_endpoint(session_id: str, _: str = Depends(require_api_key)):
+    ficha = agent.get_ficha(session_id)
+    if not ficha.get("tipo_equipo"):
+        return {"offers": []}
+
+    rows = await asyncio.to_thread(cm_service.get_offer_rows, ficha, 30)
+    analytics_service.log(session_id=session_id, tipo="ver_catalogo_cm")
+    return {"offers": rows}
+
+
 # ─── Track evento frontend ────────────────────────────────────────────────────
 
 class TrackRequest(BaseModel):
@@ -374,6 +415,7 @@ async def reset_endpoint(session_id: str, _: str = Depends(require_api_key)):
     agent.reset_session(session_id)
     _session_histories.pop(session_id, None)
     _session_price_cache.pop(session_id, None)
+    _session_cm_price_cache.pop(session_id, None)
     return {"type": "reset_ok"}
 
 

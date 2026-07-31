@@ -13,7 +13,6 @@ Flujo por mensaje:
 """
 
 import os
-import re
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,6 +21,7 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 from agents.attribute_matcher import AttributeMatcher
+from agents.processor_family import extract_linea_procesador
 
 load_dotenv()
 
@@ -99,43 +99,6 @@ COMPLEMENT_ONLY_ATTRIBUTES = {
     "tecnologia_gpu_principal",
     "generacion_procesador",
 }
-
-
-# Extrae la línea canónica del procesador (valores alineados al vocabulario del modelo LGBM)
-_LINEA_RULES = [
-    (r"Core\s+Ultra\s+9",   "Intel Core Ultra 9"),
-    (r"Core\s+Ultra\s+7",   "Intel Core Ultra 7"),
-    (r"Core\s+Ultra\s+5",   "Intel Core Ultra 5"),
-    (r"Core\s+i9",          "Intel Core i9"),
-    (r"Core\s+i7",          "Intel Core i7"),
-    (r"Core\s+i5",          "Intel Core i5"),
-    (r"Core\s+i3",          "Intel Core i3"),
-    (r"\bCeleron\b",        "Intel Celeron"),
-    (r"\bPentium\b",        "Intel Pentium"),
-    (r"\bXeon\b",           "Intel Xeon"),
-    (r"Ryzen\s+AI\s+9",     "AMD Ryzen AI 9"),
-    (r"Ryzen\s+AI\s+7",     "AMD Ryzen AI 7"),
-    (r"Ryzen\s+AI\s+5",     "AMD Ryzen AI 5"),
-    (r"Ryzen\s+9",          "AMD Ryzen 9"),
-    (r"Ryzen\s+7",          "AMD Ryzen 7"),
-    (r"Ryzen\s+5",          "AMD Ryzen 5"),
-    (r"Ryzen\s+3",          "AMD Ryzen 3"),
-    (r"\bAthlon\b",         "AMD Athlon"),
-    (r"Apple\s+M4\s+Max",   "Apple M4 Max"),
-    (r"Apple\s+M4\s+Pro",   "Apple M4 Pro"),
-    (r"Apple\s+M4",         "Apple M4"),
-    (r"Apple\s+M3\s+Pro",   "Apple M3 Pro"),
-    (r"Apple\s+M3",         "Apple M3"),
-    (r"Apple\s+M[12]",      "Apple M-Series"),
-    (r"Apple\s+M\d",        "Apple M-Series"),
-]
-
-
-def _extract_linea_procesador(procesador: str) -> Optional[str]:
-    for pattern, canonical in _LINEA_RULES:
-        if re.search(pattern, procesador, re.IGNORECASE):
-            return canonical
-    return None
 
 
 _SEPARATOR = "§§§"
@@ -471,7 +434,7 @@ class FichaAgent:
                 session["ficha"][comp_attr] = comp_val
 
             if attr == "procesador_principal" and isinstance(normalized_value, str):
-                linea = _extract_linea_procesador(normalized_value)
+                linea = extract_linea_procesador(normalized_value)
                 if linea and not session["ficha"].get("linea_procesador"):
                     complement_updates.append({
                         "attribute": "linea_procesador",
@@ -567,7 +530,7 @@ class FichaAgent:
                 session["ficha"][comp_attr] = comp_val
 
             if attr == "procesador_principal" and isinstance(normalized_value, str):
-                linea = _extract_linea_procesador(normalized_value)
+                linea = extract_linea_procesador(normalized_value)
                 if linea and not session["ficha"].get("linea_procesador"):
                     complement_updates.append({
                         "attribute": "linea_procesador",
