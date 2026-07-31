@@ -109,12 +109,15 @@ class GuardrailService:
         self,
         message: str,
         history: List[Dict],
-    ) -> Tuple[bool, str, str | None]:
+    ) -> Tuple[bool, str, str | None, object | None]:
         """
-        Retorna (allowed, reason, clean_message).
+        Retorna (allowed, reason, clean_message, usage).
         - allowed=True,  clean_message=None   → procesar mensaje original
         - allowed=True,  clean_message="..."  → procesar solo la parte válida
         - allowed=False, clean_message=None   → bloquear completamente
+        - usage: objeto `usage` de la respuesta de OpenAI (o None si falló
+          antes de llamar a la API) — para que quien llame pueda sumarlo al
+          gasto total del turno, el guardrail también consume tokens.
         En caso de error de API, falla abierto (deja pasar el original).
         """
         try:
@@ -151,8 +154,8 @@ class GuardrailService:
             allowed     = bool(result.get("allowed", True))
             reason      = result.get("reason", "")
             clean_msg   = result.get("clean_message") or None
-            return allowed, reason, clean_msg
+            return allowed, reason, clean_msg, resp.usage
 
         except Exception as exc:
             logging.warning(f"[guardrail] Error en clasificador LLM: {exc}")
-            return True, "", None  # fail-open: procesar mensaje original
+            return True, "", None, None  # fail-open: procesar mensaje original

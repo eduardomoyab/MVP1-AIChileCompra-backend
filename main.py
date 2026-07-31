@@ -34,6 +34,7 @@ from services.lgbm_price_service import LgbmPriceService
 from services.guardrail_service import GuardrailService
 from services import analytics_service
 from services import access_service
+from services import usage_service
 
 load_dotenv()
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -71,11 +72,22 @@ async def require_api_key(x_api_key: Optional[str] = Depends(_api_key_header)):
     return x_api_key
 
 
+# Correo de la persona logueada, mandado por el frontend (que ya lo sabe vía
+# su propia sesión) en el header x-user-email. Confiable porque solo el
+# frontend conoce FRONTEND_API_KEY, mismo modelo de confianza que el resto
+# del backend -- no hay verificación de identidad adicional por request.
+_user_email_header = APIKeyHeader(name="x-user-email", auto_error=False)
+
+async def get_user_email(x_user_email: Optional[str] = Depends(_user_email_header)) -> str:
+    return (x_user_email or "").strip().lower()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global agent
     agent = FichaAgent(matcher)
     lgbm_service._load()
+    usage_service.ensure_table()
     logging.info("Servidor listo — construyendo índices FAISS y dropdowns en background...")
     asyncio.create_task(asyncio.to_thread(matcher.warm))
     asyncio.create_task(asyncio.to_thread(price_service.warmup_dropdowns))
@@ -137,6 +149,13 @@ async def check_access_endpoint(email: str, _: str = Depends(require_api_key)):
     return {"allowed": allowed}
 
 
+# ─── Uso diario de tokens (panel de cuenta) ────────────────────────────────────
+
+@app.get("/api/usage")
+async def usage_endpoint(user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)):
+    return await asyncio.to_thread(usage_service.get_usage, user_email)
+
+
 # ─── Schema ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/schema")
@@ -170,7 +189,12 @@ async def get_dropdowns():
 # ─── Chat (SSE) ───────────────────────────────────────────────────────────────
 
 @app.post("/api/chat/{session_id}")
-async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(require_api_key)):
+async def chat_endpoint(
+    session_id: str,
+    body: ChatRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
     content = body.content.strip()
     if not content:
         async def empty():
@@ -181,9 +205,27 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
     async def event_gen():
         t0 = time.perf_counter()
         try:
+            # ── Límite diario de tokens: se chequea ANTES de gastar nada,
+            # ni siquiera el guardrail corre si ya está bloqueado — es lo
+            # que de verdad ahorra el gasto, no solo lo reporta después.
+            if await asyncio.to_thread(usage_service.is_blocked, user_email):
+                usage_info = await asyncio.to_thread(usage_service.get_usage, user_email)
+                yield sse({"type": "usage_limit_reached", "data": usage_info})
+                yield "data: [DONE]\n\n"
+                analytics_service.log(
+                    session_id=session_id,
+                    tipo="usage_blocked",
+                    user_msg=content,
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                    blocked=True,
+                    block_reason="límite diario de tokens alcanzado",
+                )
+                return
+
             # ── Guardrail: validar mensaje antes de procesarlo ──────────────
             history = _session_histories.get(session_id, [])
-            allowed, block_reason, clean_message = await guardrail.check(content, history)
+            allowed, block_reason, clean_message, guardrail_usage = await guardrail.check(content, history)
+            guardrail_tokens = guardrail_usage.total_tokens if guardrail_usage else 0
 
             if not allowed:
                 logging.info(f"[guardrail] Bloqueado session={session_id}: {block_reason}")
@@ -197,6 +239,8 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
                     blocked=True,
                     block_reason=block_reason,
                 )
+                # El guardrail igual gastó tokens aunque el mensaje se bloqueara.
+                await asyncio.to_thread(usage_service.add_usage, user_email, guardrail_tokens)
                 return
 
             # Usar la versión limpia si el guardrail extrajo solo la parte válida
@@ -280,6 +324,8 @@ async def chat_endpoint(session_id: str, body: ChatRequest, _: str = Depends(req
                 model=agent.model,
                 attrs_updated=",".join(u["attribute"] for u in ficha_updates) or None,
             )
+            ficha_tokens = usage.total_tokens if usage else 0
+            await asyncio.to_thread(usage_service.add_usage, user_email, guardrail_tokens + ficha_tokens)
 
         except Exception as e:
             logging.error(f"Error en chat SSE {session_id}: {e}", exc_info=True)
