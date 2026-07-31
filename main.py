@@ -153,7 +153,8 @@ async def check_access_endpoint(email: str, _: str = Depends(require_api_key)):
 
 @app.get("/api/usage")
 async def usage_endpoint(user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)):
-    return await asyncio.to_thread(usage_service.get_usage, user_email)
+    usage = await asyncio.to_thread(usage_service.get_usage, user_email)
+    return usage_service.to_public(usage)
 
 
 # ─── Schema ───────────────────────────────────────────────────────────────────
@@ -210,7 +211,7 @@ async def chat_endpoint(
             # que de verdad ahorra el gasto, no solo lo reporta después.
             if await asyncio.to_thread(usage_service.is_blocked, user_email):
                 usage_info = await asyncio.to_thread(usage_service.get_usage, user_email)
-                yield sse({"type": "usage_limit_reached", "data": usage_info})
+                yield sse({"type": "usage_limit_reached", "data": usage_service.to_public(usage_info)})
                 yield "data: [DONE]\n\n"
                 analytics_service.log(
                     session_id=session_id,

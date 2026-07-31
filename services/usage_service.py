@@ -134,6 +134,20 @@ def get_usage(email: str) -> dict:
     }
 
 
+def to_public(usage: dict) -> dict:
+    """Vista recortada para mandar al navegador — nunca los números crudos
+    de tokens (`tokens_used`/`daily_limit`/`remaining`), solo lo que la UI
+    necesita para pintar la barra. get_usage() sigue devolviendo el detalle
+    completo para uso interno del backend (ej. is_blocked(), o si algún día
+    hace falta mostrárselo a un admin en db-admin-panel)."""
+    return {
+        "percent_used": usage["percent_used"],
+        "blocked": usage["blocked"],
+        "resets_at": usage["resets_at"],
+        "unlimited": usage["daily_limit"] is None,
+    }
+
+
 def add_usage(email: str, tokens: Optional[int]) -> None:
     if not email or not tokens:
         return
