@@ -88,6 +88,7 @@ async def lifespan(app: FastAPI):
     agent = FichaAgent(matcher)
     lgbm_service._load()
     usage_service.ensure_table()
+    analytics_service.ensure_table()
     logging.info("Servidor listo — construyendo índices FAISS y dropdowns en background...")
     asyncio.create_task(asyncio.to_thread(matcher.warm))
     asyncio.create_task(asyncio.to_thread(price_service.warmup_dropdowns))
@@ -215,6 +216,7 @@ async def chat_endpoint(
                 yield "data: [DONE]\n\n"
                 analytics_service.log(
                     session_id=session_id,
+                    user_email=user_email,
                     tipo="usage_blocked",
                     user_msg=content,
                     duration_ms=int((time.perf_counter() - t0) * 1000),
@@ -234,6 +236,7 @@ async def chat_endpoint(
                 yield "data: [DONE]\n\n"
                 analytics_service.log(
                     session_id=session_id,
+                    user_email=user_email,
                     tipo="blocked",
                     user_msg=content,
                     duration_ms=int((time.perf_counter() - t0) * 1000),
@@ -314,6 +317,7 @@ async def chat_endpoint(
             ficha_updates = result.get("ficha_updates", [])
             analytics_service.log(
                 session_id=session_id,
+                user_email=user_email,
                 tipo="chat",
                 user_msg=content,
                 ai_msg=result.get("message", ""),
@@ -339,7 +343,12 @@ async def chat_endpoint(
 # ─── Manual update (SSE) ─────────────────────────────────────────────────────
 
 @app.post("/api/manual_update/{session_id}")
-async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: str = Depends(require_api_key)):
+async def manual_update_endpoint(
+    session_id: str,
+    body: ManualUpdateRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
     if not body.attribute:
         async def err():
             yield sse({"type": "error", "message": "Atributo requerido"})
@@ -389,6 +398,7 @@ async def manual_update_endpoint(session_id: str, body: ManualUpdateRequest, _: 
 
             analytics_service.log(
                 session_id=session_id,
+                user_email=user_email,
                 tipo="manual_update",
                 user_msg=f"{body.attribute}={body.value}",
                 duration_ms=int((time.perf_counter() - t0) * 1000),
@@ -428,7 +438,11 @@ def _enrich_offers(rows: list) -> list:
 
 
 @app.get("/api/offers/{session_id}")
-async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)):
+async def get_offers_endpoint(
+    session_id: str,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
     ficha = agent.get_ficha(session_id)
     if not ficha.get("tipo_equipo"):
         return {"offers": []}
@@ -438,18 +452,22 @@ async def get_offers_endpoint(session_id: str, _: str = Depends(require_api_key)
     p75 = cached.get("p75")
 
     rows = await asyncio.to_thread(price_service.get_offer_rows, ficha, 30, p25, p75)
-    analytics_service.log(session_id=session_id, tipo="ver_historial")
+    analytics_service.log(session_id=session_id, user_email=user_email, tipo="ver_historial")
     return {"offers": _enrich_offers(rows)}
 
 
 @app.get("/api/cm_offers/{session_id}")
-async def get_cm_offers_endpoint(session_id: str, _: str = Depends(require_api_key)):
+async def get_cm_offers_endpoint(
+    session_id: str,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
     ficha = agent.get_ficha(session_id)
     if not ficha.get("tipo_equipo"):
         return {"offers": []}
 
     rows = await asyncio.to_thread(cm_service.get_offer_rows, ficha, 30)
-    analytics_service.log(session_id=session_id, tipo="ver_catalogo_cm")
+    analytics_service.log(session_id=session_id, user_email=user_email, tipo="ver_catalogo_cm")
     return {"offers": rows}
 
 
@@ -459,8 +477,13 @@ class TrackRequest(BaseModel):
     tipo: str
 
 @app.post("/api/track/{session_id}")
-async def track_endpoint(session_id: str, body: TrackRequest, _: str = Depends(require_api_key)):
-    analytics_service.log(session_id=session_id, tipo=body.tipo)
+async def track_endpoint(
+    session_id: str,
+    body: TrackRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    analytics_service.log(session_id=session_id, user_email=user_email, tipo=body.tipo)
     return {"ok": True}
 
 

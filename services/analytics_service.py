@@ -42,6 +42,7 @@ def ensure_table() -> None:
                     id           SERIAL PRIMARY KEY,
                     ts           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     session_id   TEXT,
+                    user_email   TEXT,
                     tipo         TEXT,         -- 'chat' | 'blocked' | 'manual_update'
                     user_msg     TEXT,
                     ai_msg       TEXT,
@@ -56,6 +57,10 @@ def ensure_table() -> None:
                     model        TEXT
                 )
             """))
+            # La tabla ya existía en producción antes de agregar user_email —
+            # CREATE TABLE IF NOT EXISTS no altera una tabla existente, hace
+            # falta el ALTER aparte para que las columnas nuevas lleguen ahí también.
+            conn.execute(text("ALTER TABLE metricas ADD COLUMN IF NOT EXISTS user_email TEXT"))
             conn.commit()
         logging.info("[analytics] Tabla metricas lista")
     except Exception as e:
@@ -70,12 +75,12 @@ def _write_sync(row: dict) -> None:
         with engine.connect() as conn:
             conn.execute(text("""
                 INSERT INTO metricas
-                    (session_id, tipo, user_msg, ai_msg,
+                    (session_id, user_email, tipo, user_msg, ai_msg,
                      tokens_in, tokens_out, tokens_tot,
                      duration_ms, n_updates, price_found,
                      blocked, block_reason, model, attrs_updated)
                 VALUES
-                    (:session_id, :tipo, :user_msg, :ai_msg,
+                    (:session_id, :user_email, :tipo, :user_msg, :ai_msg,
                      :tokens_in, :tokens_out, :tokens_tot,
                      :duration_ms, :n_updates, :price_found,
                      :blocked, :block_reason, :model, :attrs_updated)
@@ -88,6 +93,7 @@ def _write_sync(row: dict) -> None:
 def log(
     session_id: str,
     tipo: str,
+    user_email: str = "",
     user_msg: str = "",
     ai_msg: str = "",
     tokens_in: Optional[int] = None,
@@ -106,6 +112,7 @@ def log(
     """
     row = {
         "session_id": session_id,
+        "user_email": user_email or None,
         "tipo":       tipo,
         "user_msg":   (user_msg or "")[:2000],
         "ai_msg":     (ai_msg  or "")[:4000],
