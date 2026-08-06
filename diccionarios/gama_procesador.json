@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "nota": "Clasificación de linea_procesador en 4 gamas de calidad (Básica/Media/Alta/Premium), sin distinción de marca -- usado para agrupar procesadores equivalentes entre fabricantes (Intel/AMD/Apple/Qualcomm) y evitar sesgo hacia una sola marca al recomendar o relajar búsquedas. Metodología adaptada de un trabajo previo de clasificación de gamas para computadores (línea comercial del procesador como clasificador primario, estable entre generaciones), extendida acá para cubrir el vocabulario completo de linea_procesador de este proyecto (81 de 83 valores; 'Intel' y 'Qualcomm' genéricos quedan sin gama por ser ambiguos). passmark_median: puntaje mediano de PassMark por línea, cuando se contaba con el dato -- permite ordenar por cercanía de rendimiento dentro de una misma gama.",
+  "nota": "Clasificación de linea_procesador en 4 gamas de calidad (Básica/Media/Alta/Premium), sin distinción de marca -- usado para agrupar procesadores equivalentes entre fabricantes (Intel/AMD/Apple/Qualcomm) y evitar sesgo hacia una sola marca al recomendar o relajar búsquedas. Metodología adaptada de un trabajo previo de clasificación de gamas para computadores (línea comercial del procesador como clasificador primario, estable entre generaciones), extendida acá para cubrir el vocabulario completo de linea_procesador de este proyecto (81 de 83 valores; 'Intel' y 'Qualcomm' genéricos quedan sin gama por ser ambiguos). Incluye además alias con la nomenclatura que produce agents/processor_family.py al parsear texto crudo de catálogos no normalizados (ej. 'Snapdragon X Plus' sin prefijo 'Qualcomm', variantes específicas de Apple M3/M4/M5) -- sin estos alias, cm_service.py no reconoce esas líneas como parte del grupo de su gama y termina relajando la búsqueda por completo en vez de acotarla a la gama equivalente. passmark_median: puntaje mediano de PassMark por línea, cuando se contaba con el dato -- permite ordenar por cercanía de rendimiento dentro de una misma gama.",
   "gama_order": [
     "Básica",
     "Media",
@@ -335,6 +335,63 @@
     "VIA WM": {
       "gama": "Básica",
       "passmark_median": null
+    },
+
+    "Intel Core 9": {
+      "gama": "Premium",
+      "passmark_median": null
+    },
+    "Intel N-Series": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "MediaTek Kompanio": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Apple M3": {
+      "gama": "Alta",
+      "passmark_median": 41257.0
+    },
+    "Apple M3 Pro": {
+      "gama": "Premium",
+      "passmark_median": 24402.5
+    },
+    "Apple M4": {
+      "gama": "Alta",
+      "passmark_median": 22184.0
+    },
+    "Apple M4 Pro": {
+      "gama": "Premium",
+      "passmark_median": 35366.0
+    },
+    "Apple M4 Max": {
+      "gama": "Premium",
+      "passmark_median": 41131.0
+    },
+    "Apple M5": {
+      "gama": "Premium",
+      "passmark_median": 53257.5
+    },
+    "Apple M5 Pro": {
+      "gama": "Premium",
+      "passmark_median": null
+    },
+    "Apple M5 Max": {
+      "gama": "Premium",
+      "passmark_median": null
+    },
+    "Snapdragon X": {
+      "gama": "Alta",
+      "passmark_median": 16410.0
+    },
+    "Snapdragon X Elite": {
+      "gama": "Alta",
+      "passmark_median": 22695.0
+    },
+    "Snapdragon X Plus": {
+      "gama": "Media",
+      "passmark_median": 17987.0
     }
   }
 }
