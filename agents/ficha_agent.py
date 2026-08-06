@@ -145,6 +145,24 @@ Ejemplos:
 - "ponle un buen procesador i5" → `{{"linea_procesador": "Intel Core i5"}}`  ✓  (no inventar modelo)
 - "Intel Core i5-6500" en ficha_updates sin que el usuario lo dijera → ✗ PROHIBIDO
 
+## REGLA PROCESADOR — EVITAR SESGO DE MARCA
+
+Cuando **tú** decidas qué línea de procesador recomendar (el usuario no especificó marca ni modelo), usa SIEMPRE una lista con el equivalente de Intel Y AMD para esa gama de rendimiento — nunca solo una marca. Como comprador público, no se debe favorecer sistemáticamente un fabricante sobre otro cuando ambos ofrecen un producto equivalente.
+
+Equivalencias de gama (cualquiera de las dos cumple el mismo nivel de rendimiento):
+- Básica (ofimática simple): Intel Core i3 / AMD Ryzen 3
+- Media (multitarea moderada, oficina exigente, desarrollo web): Intel Core i5 / AMD Ryzen 5
+- Alta (desarrollo intensivo, edición, análisis de datos): Intel Core i7 / AMD Ryzen 7
+- Premium (workstation, deep learning, render 3D): Intel Core i9 / AMD Ryzen 9
+
+Esta regla **NO aplica** si el usuario ya mencionó una marca de procesador o de equipo (ej. "que sea Intel", "prefiero un Lenovo con Intel", "quiero AMD") — ahí se respeta su elección (Regla 0) y se usa solo esa marca.
+
+Ejemplos:
+- "solo Office, nada exigente" (uso definido, sin marca) → `{{"linea_procesador": ["Intel Core i3", "AMD Ryzen 3"]}}`  ✓
+- "algo de gama media, no me importa la marca" → `{{"linea_procesador": ["Intel Core i5", "AMD Ryzen 5"]}}`  ✓
+- "quiero que sea Intel" → `{{"linea_procesador": "Intel Core i5"}}`  ✓  (marca explícita, no se agrega AMD)
+- "prefiero AMD" → `{{"linea_procesador": "AMD Ryzen 5"}}`  ✓  (idem)
+
 ## REGLA MÚLTIPLES VALORES Y RANGOS
 
 Varios atributos admiten múltiples opciones (array JSON) o rangos (dict con min/max). Úsalos cuando el usuario pide alternativas o un intervalo.
@@ -266,7 +284,7 @@ Entendido. Para afinar las especificaciones, ¿qué programas usarán principalm
 Usuario: "solo Office, Word y Excel básico, correo, nada más exigente"
 Con ese uso, 8 GB de RAM y 256 GB de almacenamiento son suficientes.
 {_SEPARATOR}
-{{"ficha_updates": {{"linea_procesador": "Intel Core i5", "total_ram_gb": 8, "tecnologia_ram": "DDR4", "total_almacenamiento_gb": 256, "tecnologia_disco_principal": "NVMe SSD", "tipo_configuracion_discos": "solo SSD", "tiene_gpu_dedicada": false, "sistema_operativo": "Microsoft Windows 11 Home"}}, "questions": []}}
+{{"ficha_updates": {{"linea_procesador": ["Intel Core i3", "AMD Ryzen 3"], "total_ram_gb": 8, "tecnologia_ram": "DDR4", "total_almacenamiento_gb": 256, "tecnologia_disco_principal": "NVMe SSD", "tipo_configuracion_discos": "solo SSD", "tiene_gpu_dedicada": false, "sistema_operativo": "Microsoft Windows 11 Home"}}, "questions": []}}
 
 Usuario: "quiero 32 GB de RAM para trabajo de oficina básico"
 Registrado con 32 GB según tu indicación.

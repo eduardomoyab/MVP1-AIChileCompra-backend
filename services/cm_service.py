@@ -17,8 +17,14 @@ PrecioCA, acá:
     (premium) queda más "similar" a "Pentium Gold 7505" que "Celeron
     N150" (gama real equivalente). Un modelo de embeddings genérico no
     entiende jerarquía de rendimiento de procesadores, solo similitud
-    textual superficial. Por eso, sin match de familia se relaja el
-    filtro de CPU y se muestran todos los candidatos estructurales
+    textual superficial. Por eso, sin match de familia se relaja primero
+    al grupo de líneas equivalentes en la misma gama (gama_service.py:
+    Básica/Media/Alta/Premium, sin distinción de marca -- ej. pedido
+    "AMD Ryzen 5" sin match relaja a también aceptar "Intel Core i5",
+    "Apple M1 Pro", etc., todas gama Media). Esto evita mostrar solo lo
+    que más abunda en el catálogo por marca cuando no hay match exacto.
+    Si tampoco hay nada en esa gama, recién ahí se suelta el filtro de
+    CPU por completo y se muestran todos los candidatos estructurales
     (tipo/RAM/almacenamiento) ordenados por precio — con ~93 productos
     en el catálogo, es fácil de escanear a simple vista.
   - Los precios están en USD: se convierten a CLP con currency_service.
@@ -36,6 +42,7 @@ from sqlalchemy.exc import OperationalError
 from dotenv import load_dotenv
 
 from agents.processor_family import extract_linea_procesador
+from services import gama_service
 from services.currency_service import get_usd_clp
 
 load_dotenv()
@@ -256,7 +263,7 @@ class CMService:
     def _find_candidates(self, ficha: Dict[str, Any]) -> Tuple[List[Dict], str, bool, List[str], List[str]]:
         """
         Devuelve (candidatos_finales, match_type_procesador, relajado, filtros_aplicados, no_verificables).
-        match_type_procesador: "family" | "none"
+        match_type_procesador: "family" | "gama" | "none"
         """
         tipo = ficha.get("tipo_equipo")
         if not tipo:
@@ -312,8 +319,21 @@ class CMService:
             family_matches = [r for r in candidates if r["_familia"] and r["_familia"].lower() in fl_lower]
             if family_matches:
                 return family_matches, "family", False, applied + ["línea proc."], unverified
-            # Había preferencia de procesador pero ninguna familia calzó — se relaja
-            # (ver nota en el docstring del módulo sobre por qué no se usa similitud
+
+            # Sin match exacto de línea: relajar primero al grupo de líneas
+            # equivalentes en la misma gama (cualquier marca) antes de soltar
+            # el filtro de CPU por completo -- ver nota en el docstring del
+            # módulo. Evita que la relajación total termine mostrando solo lo
+            # que más abunda en el catálogo por marca.
+            group = gama_service.expand_to_group(ficha_lineas)
+            group_lower = {g.lower() for g in group} - fl_lower
+            if group_lower:
+                gama_matches = [r for r in candidates if r["_familia"] and r["_familia"].lower() in group_lower]
+                if gama_matches:
+                    return gama_matches, "gama", True, applied + ["gama equivalente"], unverified
+
+            # Tampoco hay nada en la misma gama — se relaja del todo (ver nota
+            # en el docstring del módulo sobre por qué no se usa similitud
             # semántica acá) para no dejar el panel vacío solo por el CPU.
             return candidates, "none", True, applied, unverified
 

@@ -1,0 +1,340 @@
+{
+  "version": "1.0",
+  "nota": "Clasificación de linea_procesador en 4 gamas de calidad (Básica/Media/Alta/Premium), sin distinción de marca -- usado para agrupar procesadores equivalentes entre fabricantes (Intel/AMD/Apple/Qualcomm) y evitar sesgo hacia una sola marca al recomendar o relajar búsquedas. Metodología adaptada de un trabajo previo de clasificación de gamas para computadores (línea comercial del procesador como clasificador primario, estable entre generaciones), extendida acá para cubrir el vocabulario completo de linea_procesador de este proyecto (81 de 83 valores; 'Intel' y 'Qualcomm' genéricos quedan sin gama por ser ambiguos). passmark_median: puntaje mediano de PassMark por línea, cuando se contaba con el dato -- permite ordenar por cercanía de rendimiento dentro de una misma gama.",
+  "gama_order": [
+    "Básica",
+    "Media",
+    "Alta",
+    "Premium"
+  ],
+  "sin_gama": [
+    "Intel",
+    "Qualcomm"
+  ],
+  "linea_to_gama": {
+    "AMD A10": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD A12": {
+      "gama": "Básica",
+      "passmark_median": 3005.0
+    },
+    "AMD A4": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD A6": {
+      "gama": "Básica",
+      "passmark_median": 1439.0
+    },
+    "AMD A8": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD A9": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Athlon": {
+      "gama": "Básica",
+      "passmark_median": 670.0
+    },
+    "AMD Athlon 64": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Athlon 64 X2": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Athlon Gold": {
+      "gama": "Básica",
+      "passmark_median": 6922.0
+    },
+    "AMD Athlon II": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Athlon II Neo": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Athlon Neo": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Athlon Neo X2": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Athlon Silver": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Athlon X2": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD C-Series": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD E": {
+      "gama": "Básica",
+      "passmark_median": 597.0
+    },
+    "AMD E-Series": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD E1": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD E2": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD FX": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Mobile Sempron": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD PRO A4": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Phenom II": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Pro A10": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Pro A8": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Ryzen 3": {
+      "gama": "Básica",
+      "passmark_median": 9700.0
+    },
+    "AMD Ryzen 5": {
+      "gama": "Media",
+      "passmark_median": 16787.0
+    },
+    "AMD Ryzen 7": {
+      "gama": "Alta",
+      "passmark_median": 22722.0
+    },
+    "AMD Ryzen 9": {
+      "gama": "Premium",
+      "passmark_median": 34255.0
+    },
+    "AMD Ryzen AI 5": {
+      "gama": "Media",
+      "passmark_median": 19048.0
+    },
+    "AMD Ryzen AI 5 Pro": {
+      "gama": "Media",
+      "passmark_median": null
+    },
+    "AMD Ryzen AI 7": {
+      "gama": "Alta",
+      "passmark_median": 24934.0
+    },
+    "AMD Ryzen AI 7 Pro": {
+      "gama": "Alta",
+      "passmark_median": null
+    },
+    "AMD Ryzen AI 9": {
+      "gama": "Premium",
+      "passmark_median": 33430.0
+    },
+    "AMD Ryzen AI Max Pro": {
+      "gama": "Premium",
+      "passmark_median": 32026.0
+    },
+    "AMD Ryzen AI Max+": {
+      "gama": "Premium",
+      "passmark_median": 43156.5
+    },
+    "AMD Ryzen AI Max+ Pro": {
+      "gama": "Premium",
+      "passmark_median": null
+    },
+    "AMD Sempron": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Turion II": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Turion II Ultra": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Turion Neo X2": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Turion X2": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "AMD Turion X2 Ultra": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Apple A-Series": {
+      "gama": "Básica",
+      "passmark_median": 9840.0
+    },
+    "Apple M-Series": {
+      "gama": "Alta",
+      "passmark_median": 22069.0
+    },
+    "Intel Atom": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Celeron": {
+      "gama": "Básica",
+      "passmark_median": 771.0
+    },
+    "Intel Celeron M": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Core 2 Duo": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Core 2 Quad": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Core 2 Solo": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Core 3": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Core 5": {
+      "gama": "Media",
+      "passmark_median": null
+    },
+    "Intel Core 7": {
+      "gama": "Alta",
+      "passmark_median": 24533.0
+    },
+    "Intel Core Duo": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Core M": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Core M3": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Core M5": {
+      "gama": "Media",
+      "passmark_median": null
+    },
+    "Intel Core M7": {
+      "gama": "Alta",
+      "passmark_median": null
+    },
+    "Intel Core Ultra 5": {
+      "gama": "Alta",
+      "passmark_median": 26567.0
+    },
+    "Intel Core Ultra 7": {
+      "gama": "Alta",
+      "passmark_median": 30747.0
+    },
+    "Intel Core Ultra 9": {
+      "gama": "Premium",
+      "passmark_median": 55852.0
+    },
+    "Intel Core i3": {
+      "gama": "Básica",
+      "passmark_median": 3450.0
+    },
+    "Intel Core i5": {
+      "gama": "Media",
+      "passmark_median": 5408.0
+    },
+    "Intel Core i7": {
+      "gama": "Alta",
+      "passmark_median": 6754.0
+    },
+    "Intel Core i9": {
+      "gama": "Premium",
+      "passmark_median": 25475.0
+    },
+    "Intel Pentium": {
+      "gama": "Básica",
+      "passmark_median": 942.0
+    },
+    "Intel Pentium Dual Core": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Intel Xeon": {
+      "gama": "Premium",
+      "passmark_median": 12127.0
+    },
+    "Mediatek": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "NVIDIA Tegra": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Qualcomm Snapdragon X": {
+      "gama": "Alta",
+      "passmark_median": 16410.0
+    },
+    "Qualcomm Snapdragon X Elite": {
+      "gama": "Alta",
+      "passmark_median": 22695.0
+    },
+    "Qualcomm Snapdragon X Plus": {
+      "gama": "Media",
+      "passmark_median": 17987.0
+    },
+    "Rockchip": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "Samsung Exynos": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "VIA C7-M": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "VIA Nano": {
+      "gama": "Básica",
+      "passmark_median": null
+    },
+    "VIA WM": {
+      "gama": "Básica",
+      "passmark_median": null
+    }
+  }
+}
