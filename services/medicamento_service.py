@@ -142,8 +142,23 @@ class MedicamentoService:
         def _norm(col: str) -> str:
             return f"NULLIF(UPPER(TRIM(COALESCE({col}, ''))), 'NO ESPECIFICADO')"
 
-        group_cols = ", ".join(_norm(c) for c in _RESULT_COLS)
+        # "cantidad" también existe en OfertaProducto (op.cantidad) -- hay
+        # que calificarla con la tabla o el JOIN de precio la deja ambigua.
+        def _qualify(c: str) -> str:
+            return f"{_TABLE_NAME}.cantidad" if c == "cantidad" else c
 
+        group_cols = ", ".join(_norm(_qualify(c)) for c in _RESULT_COLS)
+
+        # Precio: join contra OfertaProducto (misma tabla que ya usa PrecioCA
+        # para Computadores) por id_oferta_producto_aquiles -- ese match es
+        # 1:1 y cubre el 100% de las filas de extractor_medicamentos
+        # (verificado contra la BD real). Se usa precio_unitario_iva (CLP con
+        # IVA) para ser consistente con lo que ya expone PrecioCA. Como cada
+        # grupo junta muchas compras históricas del "mismo" producto con
+        # precios que varían fuerte según el tamaño del lote/envase
+        # cotizado, se reporta un rango de percentiles (p25/mediana/p75) en
+        # vez de un promedio o mínimo crudo -- la mediana no se distorsiona
+        # con los ítems que algún proveedor cotizó en $0 o $1 por error.
         sql = text(f"""
             SELECT
                 MAX(nombre_producto)    AS nombre_producto,
@@ -153,10 +168,15 @@ class MedicamentoService:
                 MAX(forma_farmaceutica) AS forma_farmaceutica,
                 MAX(concentracion_1)    AS concentracion_1,
                 MAX(concentracion_2)    AS concentracion_2,
-                MAX(cantidad)           AS cantidad,
+                MAX({_TABLE_NAME}.cantidad) AS cantidad,
                 MAX(unidad_cantidad)    AS unidad_cantidad,
-                COUNT(*)                AS n_compras
+                COUNT(*)                AS n_compras,
+                COUNT(op.precio_unitario_iva) AS n_con_precio,
+                PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY op.precio_unitario_iva) AS precio_p25,
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY op.precio_unitario_iva) AS precio_mediana,
+                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY op.precio_unitario_iva) AS precio_p75
             FROM "{_TABLE_NAME}"
+            LEFT JOIN "OfertaProducto" op ON op._id_aquiles = {_TABLE_NAME}.id_oferta_producto_aquiles::integer
             WHERE {where_sql}
             GROUP BY {group_cols}
             ORDER BY n_compras DESC, MAX(nombre_producto) ASC
@@ -168,9 +188,9 @@ class MedicamentoService:
             try:
                 with engine.connect() as conn:
                     rows = conn.execute(sql, params).mappings().all()
-                    results = [dict(r) for r in rows]
+                    results = [self._format_result(r) for r in rows]
                     facets = self._compute_facets(conn, tokens, filters)
-                return {"results": results, "count": len(results), "query": query, "facets": facets}
+                return {"results": results, "count": len(results), "query": query, "facets": facets, "currency": "CLP"}
             except OperationalError as e:
                 logging.warning(f"[Medicamentos] Error de conexión (intento {attempt + 1}/{_DB_MAX_RETRIES}): {e}")
                 _reset_engine()
@@ -182,6 +202,15 @@ class MedicamentoService:
                 return {"results": [], "count": 0, "facets": {}}
 
         return {"results": [], "count": 0, "facets": {}}
+
+    @staticmethod
+    def _format_result(row) -> Dict[str, Any]:
+        d = dict(row)
+        for key in ("precio_p25", "precio_mediana", "precio_p75"):
+            d[key] = int(round(d[key])) if d.get(key) is not None else None
+        d["n_con_precio"] = int(d["n_con_precio"])
+        d["n_compras"] = int(d["n_compras"])
+        return d
 
     def _compute_facets(self, conn, tokens: List[str], filters: Dict[str, Optional[str]]) -> Dict[str, List[Dict]]:
         facets: Dict[str, List[Dict]] = {}
