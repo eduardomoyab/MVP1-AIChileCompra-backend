@@ -497,19 +497,20 @@ async def medicamentos_search_endpoint(
     q: str = "",
     laboratorio: Optional[str] = None,
     forma_farmaceutica: Optional[str] = None,
+    concentracion: Optional[str] = None,
     user_email: str = Depends(get_user_email),
     _: str = Depends(require_api_key),
 ):
     result = await asyncio.to_thread(
-        medicamento_service.search, q, laboratorio, forma_farmaceutica, 30
+        medicamento_service.search,
+        q,
+        laboratorio,
+        forma_farmaceutica,
+        concentracion,
+        30,
     )
     analytics_service.log(session_id="", user_email=user_email, tipo="medicamento_search", user_msg=q)
     return result
-
-
-@app.get("/api/medicamentos/dropdowns")
-async def medicamentos_dropdowns_endpoint(_: str = Depends(require_api_key)):
-    return await asyncio.to_thread(medicamento_service.get_dropdown_values)
 
 
 # ─── Reset ────────────────────────────────────────────────────────────────────

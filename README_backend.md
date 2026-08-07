@@ -73,8 +73,7 @@ flowchart TD
 | `GET` | `/api/cm_offers/{session_id}` | **Sí** | No | Catálogo Convenio Marco coincidente |
 | `POST` | `/api/track/{session_id}` | **Sí** | No | Evento de analytics del frontend |
 | `POST` | `/api/reset/{session_id}` | **Sí** | No | Reiniciar sesión |
-| `GET` | `/api/medicamentos/search` | **Sí** | No | Buscador de medicamentos (sin ficha/chat) — ver `MedicamentoService` |
-| `GET` | `/api/medicamentos/dropdowns` | **Sí** | No | Laboratorios / formas farmacéuticas para filtros |
+| `GET` | `/api/medicamentos/search` | **Sí** | No | Buscador de medicamentos con filtros facetados (laboratorio, forma farmacéutica, concentración) — ver `MedicamentoService` |
 
 Autenticación: header `x-api-key: <FRONTEND_API_KEY>`.
 
