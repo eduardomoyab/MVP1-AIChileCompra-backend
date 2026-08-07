@@ -3,9 +3,10 @@ main.py — Backend Asistente Compra Ágil
 FastAPI + HTTP SSE
 
 Endpoints:
-  POST /api/chat/{session_id}          → Chat streaming (SSE)
+  POST /api/chat/{session_id}          → Chat streaming (SSE) — Computadores
   POST /api/manual_update/{session_id} → Actualización manual de atributo (SSE)
   POST /api/reset/{session_id}         → Resetear sesión
+  GET  /api/medicamentos/search        → Buscador de medicamentos (sin ficha/chat)
   GET  /health                         → Estado del servicio
   GET  /api/schema                     → Esquema de atributos y valores válidos
 """
@@ -35,6 +36,7 @@ from services.guardrail_service import GuardrailService
 from services import analytics_service
 from services import access_service
 from services import usage_service
+from services.medicamento_service import MedicamentoService
 
 load_dotenv()
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -47,6 +49,7 @@ logging.basicConfig(
 matcher = AttributeMatcher()
 price_service = PriceService()
 cm_service = CMService()
+medicamento_service = MedicamentoService()
 lgbm_service = LgbmPriceService()
 guardrail = GuardrailService()
 agent: FichaAgent = None
@@ -485,6 +488,28 @@ async def track_endpoint(
 ):
     analytics_service.log(session_id=session_id, user_email=user_email, tipo=body.tipo)
     return {"ok": True}
+
+
+# ─── Medicamentos (buscador, sin ficha ni chat) ────────────────────────────────
+
+@app.get("/api/medicamentos/search")
+async def medicamentos_search_endpoint(
+    q: str = "",
+    laboratorio: Optional[str] = None,
+    forma_farmaceutica: Optional[str] = None,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    result = await asyncio.to_thread(
+        medicamento_service.search, q, laboratorio, forma_farmaceutica, 30
+    )
+    analytics_service.log(session_id="", user_email=user_email, tipo="medicamento_search", user_msg=q)
+    return result
+
+
+@app.get("/api/medicamentos/dropdowns")
+async def medicamentos_dropdowns_endpoint(_: str = Depends(require_api_key)):
+    return await asyncio.to_thread(medicamento_service.get_dropdown_values)
 
 
 # ─── Reset ────────────────────────────────────────────────────────────────────

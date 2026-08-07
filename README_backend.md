@@ -1,6 +1,6 @@
-# Backend — Asistente IA Compra Ágil
+# Backend — Asistente IA Compras Públicas
 
-API REST con streaming SSE construida en **FastAPI**. Contiene toda la lógica de negocio: agente conversacional, normalización semántica vectorial (FAISS), estimación de precio histórico (PostgreSQL) y guardrail de seguridad.
+API REST con streaming SSE construida en **FastAPI**. Contiene toda la lógica de negocio, organizada por categoría: agente conversacional + normalización semántica vectorial (FAISS) + estimación de precio histórico para **Computadores**, y un buscador estructurado sobre historial de compras para **Medicamentos** (`MedicamentoService`). Incluye guardrail de seguridad para el chat.
 
 > Repositorio: `github.com/eduardomoyab/MVP1-AIChileCompra-backend` · versión `v1.0.0`
 
@@ -70,8 +70,11 @@ flowchart TD
 | `POST` | `/api/chat/{session_id}` | **Sí** | **SSE** | Chat con agente IA |
 | `POST` | `/api/manual_update/{session_id}` | **Sí** | **SSE** | Edición manual de un atributo |
 | `GET` | `/api/offers/{session_id}` | **Sí** | No | Historial de OC reales coincidentes |
+| `GET` | `/api/cm_offers/{session_id}` | **Sí** | No | Catálogo Convenio Marco coincidente |
 | `POST` | `/api/track/{session_id}` | **Sí** | No | Evento de analytics del frontend |
 | `POST` | `/api/reset/{session_id}` | **Sí** | No | Reiniciar sesión |
+| `GET` | `/api/medicamentos/search` | **Sí** | No | Buscador de medicamentos (sin ficha/chat) — ver `MedicamentoService` |
+| `GET` | `/api/medicamentos/dropdowns` | **Sí** | No | Laboratorios / formas farmacéuticas para filtros |
 
 Autenticación: header `x-api-key: <FRONTEND_API_KEY>`.
 

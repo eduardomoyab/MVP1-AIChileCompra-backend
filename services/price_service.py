@@ -18,7 +18,11 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from dotenv import load_dotenv
 
+from agents.attribute_matcher import AttributeMatcher
+
 load_dotenv()
+
+_attr_matcher = AttributeMatcher()
 
 _DB_URL = os.getenv("DATABASE_URL")
 _BROAD_SEARCH_THRESHOLD = int(os.getenv("BROAD_SEARCH_THRESHOLD", "1000"))
@@ -56,6 +60,55 @@ DROPDOWN_DB_COLS = [
     ("sistema_operativo",      "sistema_operativo"),
     ("pantalla_pulgadas",      "pantalla_pulgadas"),
 ]
+
+# Columnas de texto que tienen diccionario canónico (attribute_dictionary.csv,
+# el mismo que usa el resto de la app para normalizar la ficha) -- PrecioCA
+# no pasó por ese pipeline de normalización al cargarse, así que un mismo
+# valor puede aparecer con distinto casing/espacios ("HP" / "hp", "windows
+# 11 home" / "Microsoft Windows 11 Home"). Acá se fusionan esas variantes
+# contra su forma canónica -- solo cuando calzan EXACTO salvo mayúsculas y
+# espacios, nunca por similitud/semántica (eso ya se probó que no es
+# confiable para este tipo de dato, ver docstring de cm_service.py). Un
+# valor que no calce con nada del diccionario se deja tal cual: es dato
+# real que no debe perderse ni forzarse a un valor que no le corresponde.
+_DICT_NORMALIZED_COLS = {"marca", "procesador_principal", "linea_procesador", "sistema_operativo"}
+
+
+def _canonical_lookup(atributo: str) -> Dict[str, str]:
+    valores = _attr_matcher.get_valid_values("Computadores", atributo)
+    return {v.strip().lower(): v for v in valores}
+
+
+def _normalize_dropdown_values(atributo: str, raw_values: List[str]) -> List[str]:
+    lookup = _canonical_lookup(atributo)
+    if not lookup:
+        return raw_values
+    merged: Dict[str, str] = {}
+    for v in raw_values:
+        canon = lookup.get(v.strip().lower(), v.strip())
+        merged[canon] = canon
+    return list(merged.values())
+
+
+def _dedupe_casing(values: List[str]) -> List[str]:
+    """Para valores que no calzaron con ningún diccionario canónico (marcas
+    chicas/proveedores que no están en attribute_dictionary.csv, por
+    ejemplo): igual funde variantes que son EXACTAMENTE el mismo texto
+    salvo mayúsculas/espacios ("COMPUELITE" == "CompuElite"). Nunca junta
+    valores con redacción distinta ("COMPU ELITE" y "COMPUELITE" quedan
+    separados -- no son el mismo string en minúsculas, podrían ser cosas
+    distintas). Entre las variantes de un mismo grupo, se prefiere la que
+    ya viene en Title Case; si ninguna lo está, la primera en orden
+    alfabético -- determinístico, no depende del orden en que llegó de la DB."""
+    groups: Dict[str, List[str]] = {}
+    for v in values:
+        groups.setdefault(v.strip().lower(), []).append(v.strip())
+
+    def _pick(variants: List[str]) -> str:
+        title_like = [v for v in variants if v == v.title()]
+        return sorted(title_like or variants)[0]
+
+    return [_pick(variants) for variants in groups.values()]
 
 
 def _get_engine():
@@ -337,6 +390,9 @@ class PriceService:
                 if col in _NUMERIC_COLS:
                     values.sort(key=_numeric_key)
                 else:
+                    if col in _DICT_NORMALIZED_COLS:
+                        values = _normalize_dropdown_values(col, values)
+                    values = _dedupe_casing(values)
                     values.sort()
                 result[field] = values
             except Exception as e:
