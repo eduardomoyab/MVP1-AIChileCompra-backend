@@ -10,7 +10,7 @@ vía GET /api/auth/check_access en vez de conectarse él mismo a la base.
 
 import os
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -50,6 +50,50 @@ def is_email_allowed(email: str) -> bool:
     except Exception as e:
         logging.warning(f"[access] Error consultando lista blanca de acceso: {e}")
         return False
+
+
+def get_allowed_sections(email: str) -> Optional[List[str]]:
+    """Secciones (slugs) que este correo puede ver dentro de la app,
+    administradas desde "Aplicaciones" > detalle de una app, en
+    db-admin-panel. Devuelve None si la app no tiene ninguna sección
+    definida todavía (sin restricción -- comportamiento previo a este
+    mecanismo, para no romper apps que nunca configuren secciones), o la
+    lista de slugs asignados a este correo (puede ser vacía: tiene acceso
+    a la app pero ningún admin le asignó una sección todavía)."""
+    engine = _get_engine()
+    if not engine or not email:
+        return []
+    try:
+        with engine.connect() as conn:
+            total = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*) FROM panel_admin.application_sections s
+                    JOIN panel_admin.applications a ON a.id = s.application_id
+                    WHERE a.slug = :slug
+                    """
+                ),
+                {"slug": _APPLICATION_SLUG},
+            ).scalar()
+            if not total:
+                return None
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT s.slug
+                    FROM panel_admin.application_sections s
+                    JOIN panel_admin.applications a ON a.id = s.application_id
+                    JOIN panel_admin.application_user_sections us ON us.section_id = s.id
+                    JOIN panel_admin.application_users au ON au.id = us.application_user_id
+                    WHERE a.slug = :slug AND au.email = :email
+                    """
+                ),
+                {"slug": _APPLICATION_SLUG, "email": email.strip().lower()},
+            ).fetchall()
+            return [r[0] for r in rows]
+    except Exception as e:
+        logging.warning(f"[access] Error consultando secciones permitidas de '{email}': {e}")
+        return []
 
 
 def get_daily_limit(email: str) -> Optional[int]:

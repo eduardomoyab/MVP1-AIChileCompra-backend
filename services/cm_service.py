@@ -8,9 +8,13 @@ PrecioCA, acá:
   - Es un catálogo chico (decenas de productos), no un histórico de
     transacciones: se cachea completo en memoria (TTL) y el matching se
     hace en Python, no con SQL dinámico.
-  - Los atributos de texto (RAM, almacenamiento, procesador) no vienen
-    normalizados como en la ficha, así que se parsean con regex y, para
-    el procesador, se usa una familia por reglas (processor_family.py).
+  - PrecioCM se arma (ver vista_CM.sql) sobre cm_computadores.
+    productos_extraccion, extraída con el mismo esquema de atributos que
+    PrecioCA -- linea_procesador, tecnologia_ram, tiene_gpu_dedicada, etc.
+    ya vienen razonablemente normalizados. RAM/almacenamiento/núcleos igual
+    se parsean con regex acá porque en la vista son texto libre ("8 GB");
+    para el procesador se prefiere el linea_procesador de la vista y, si
+    faltara, se usa una familia por reglas (processor_family.py) de respaldo.
     Se probó un fallback semántico (embeddings) para cuando no hay match
     de familia, pero contra el catálogo real los scores de similitud
     (0.37–0.68) no separan por tier de CPU — ej. "Intel Core i5 1250P"
@@ -95,6 +99,28 @@ def _parse_storage_gb(raw: Any) -> Optional[float]:
     return val * 1000 if unit == "TB" else val
 
 
+def _clean_enum(raw: Any) -> Optional[str]:
+    # productos_extraccion deja "No especificado" (mismo criterio que
+    # extractor_combined/PrecioCA) cuando el dato no vino en la ficha del
+    # producto -- se trata igual que NULL/vacío para filtrar y para
+    # detectar cobertura real.
+    if not raw:
+        return None
+    s = str(raw).strip()
+    return s if s and s.lower() != "no especificado" else None
+
+
+def _gpu_bool(raw: Any) -> Optional[bool]:
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s in ("true", "si", "sí", "yes", "1"):
+        return True
+    if s in ("false", "no", "0"):
+        return False
+    return None  # "no especificado" u otro valor no interpretable
+
+
 def _fetch_rows() -> List[Dict]:
     engine = _get_engine()
     if not engine:
@@ -110,7 +136,17 @@ def _fetch_rows() -> List[Dict]:
                 row["_tipo_lower"] = (row.get("tipo_equipo") or "").strip().lower()
                 row["_ram_gb"] = _parse_ram_gb(row.get("total_ram_gb"))
                 row["_storage_gb"] = _parse_storage_gb(row.get("total_almacenamiento_gb"))
-                row["_familia"] = extract_linea_procesador(row.get("procesador_principal"))
+                row["_nucleos"] = _parse_ram_gb(row.get("nucleos_procesador"))
+                row["_tecnologia_ram"] = _clean_enum(row.get("tecnologia_ram"))
+                row["_tecnologia_disco"] = _clean_enum(row.get("tecnologia_disco_principal"))
+                row["_config_discos"] = _clean_enum(row.get("tipo_configuracion_discos"))
+                row["_generacion"] = _clean_enum(row.get("generacion_procesador"))
+                row["_gpu_dedicada"] = _gpu_bool(row.get("tiene_gpu_dedicada"))
+                # linea_procesador ahora viene de productos_extraccion (misma
+                # extracción que PrecioCA, ~100% cobertura) -- se prefiere
+                # sobre la familia derivada por regex, que queda solo como
+                # respaldo si algún producto no trajera el dato.
+                row["_familia"] = _clean_enum(row.get("linea_procesador")) or extract_linea_procesador(row.get("procesador_principal"))
                 result.append(row)
             logging.info(f"[PrecioCM] Catálogo cargado: {len(result)} productos")
             return result
@@ -176,6 +212,19 @@ def _text_match(requested: Any, actual: Optional[str]) -> bool:
     return str(requested).lower() in actual_l
 
 
+def _exact_match(requested: Any, actual: Optional[str]) -> bool:
+    # A diferencia de _text_match (substring): las tecnologías de RAM son
+    # tokens tipo enum donde el substring da falsos positivos -- "DDR5" es
+    # substring de "LPDDR5", pero son tecnologías distintas (LPDDR es RAM
+    # de bajo consumo para notebooks, no equivalente a DDR de escritorio).
+    if not actual:
+        return False
+    actual_l = actual.strip().lower()
+    if isinstance(requested, list):
+        return any(str(v).strip().lower() == actual_l for v in requested if v)
+    return str(requested).strip().lower() == actual_l
+
+
 def _os_family(text: Any) -> Optional[str]:
     if not text:
         return None
@@ -231,14 +280,34 @@ def _wifi_match(requested: Any, actual: Optional[str]) -> bool:
     return _wifi_token(requested) == actual_tok
 
 
+def _soft_filter(candidates, applied, unverified, *, requested, getter, matcher, label):
+    """Filtra por un atributo con cobertura PARCIAL en el catálogo CM (a
+    diferencia de tipo/marca/RAM, que casi siempre vienen informados): si
+    NINGÚN candidato actual trae el dato, no se filtra -- se marca "no
+    verificable" en vez de vaciar el panel solo porque ese campo no viene
+    informado para nada en el subconjunto actual. Si algunos sí lo traen y
+    calzan, se acota a esos; si no calzan, no se reduce (evita vaciar los
+    resultados por un atributo secundario)."""
+    with_data = [r for r in candidates if getter(r) is not None]
+    if not with_data:
+        unverified.append(label)
+        return candidates
+    matched = [r for r in with_data if matcher(requested, getter(r))]
+    if matched:
+        applied.append(label)
+        return matched
+    return candidates
+
+
 # Atributos que la ficha puede pedir pero que PrecioCM no captura como columna
 # estructurada — no es un problema de formato, el dato simplemente no existe
 # para ningún producto del catálogo. Se avisa en vez de ignorarlo en silencio.
+# (tecnologia_ram/tecnologia_disco_principal/tipo_configuracion_discos/
+# tiene_gpu_dedicada salieron de acá: ahora sí son columnas reales de
+# productos_extraccion y se filtran dinámicamente en _find_candidates --
+# quedan solo los que PrecioCA tampoco filtra realmente, ver PRICE_QUERY_COLS
+# en price_service.py.)
 UNVERIFIABLE_LABELS = {
-    "tecnologia_ram": "tecnología RAM",
-    "tecnologia_disco_principal": "tecnología de disco",
-    "tipo_configuracion_discos": "configuración de discos",
-    "tiene_gpu_dedicada": "GPU dedicada",
     "gpu_dedicada_nombre": "GPU dedicada",
     "pantalla_pulgadas": "tamaño de pantalla",
 }
@@ -285,16 +354,12 @@ class CMService:
         if ficha.get("wifi_generacion"):
             # ~0% de los laptops del catálogo traen wifi_generacion informado
             # (AIO/Desktop sí, 100%) — filtrar directo dejaría el panel vacío
-            # cada vez que se pide Wi-Fi en un laptop. Solo se filtra si hay
-            # candidatos con el dato; si no, se marca como no verificable.
-            with_wifi = [r for r in candidates if r.get("wifi_generacion")]
-            if with_wifi:
-                matched = [r for r in with_wifi if _wifi_match(ficha["wifi_generacion"], r.get("wifi_generacion"))]
-                if matched:
-                    candidates = matched
-                    applied.append("Wi-Fi")
-            else:
-                unverified.append("Wi-Fi")
+            # cada vez que se pide Wi-Fi en un laptop. Ver _soft_filter.
+            candidates = _soft_filter(
+                candidates, applied, unverified,
+                requested=ficha["wifi_generacion"], getter=lambda r: r.get("wifi_generacion") or None,
+                matcher=_wifi_match, label="Wi-Fi",
+            )
 
         if ficha.get("total_ram_gb") is not None:
             candidates = [r for r in candidates if _numeric_match(ficha["total_ram_gb"], r["_ram_gb"])]
@@ -303,6 +368,50 @@ class CMService:
         if ficha.get("total_almacenamiento_gb") is not None:
             candidates = [r for r in candidates if _numeric_match(ficha["total_almacenamiento_gb"], r["_storage_gb"])]
             applied.append("almacenamiento")
+
+        # ── Atributos con cobertura parcial en productos_extraccion (misma
+        # lista que PriceService.PRICE_QUERY_COLS filtra para PrecioCA) ──
+        if ficha.get("tecnologia_ram"):
+            candidates = _soft_filter(
+                candidates, applied, unverified,
+                requested=ficha["tecnologia_ram"], getter=lambda r: r["_tecnologia_ram"],
+                matcher=_exact_match, label="tecnología RAM",
+            )
+
+        if ficha.get("tecnologia_disco_principal"):
+            candidates = _soft_filter(
+                candidates, applied, unverified,
+                requested=ficha["tecnologia_disco_principal"], getter=lambda r: r["_tecnologia_disco"],
+                matcher=_text_match, label="tecnología disco",
+            )
+
+        if ficha.get("tipo_configuracion_discos"):
+            candidates = _soft_filter(
+                candidates, applied, unverified,
+                requested=ficha["tipo_configuracion_discos"], getter=lambda r: r["_config_discos"],
+                matcher=_text_match, label="config. discos",
+            )
+
+        if ficha.get("tiene_gpu_dedicada") is not None:
+            candidates = _soft_filter(
+                candidates, applied, unverified,
+                requested=ficha["tiene_gpu_dedicada"], getter=lambda r: r["_gpu_dedicada"],
+                matcher=lambda req, act: bool(req) == bool(act), label="GPU dedicada",
+            )
+
+        if ficha.get("generacion_procesador"):
+            candidates = _soft_filter(
+                candidates, applied, unverified,
+                requested=ficha["generacion_procesador"], getter=lambda r: r["_generacion"],
+                matcher=_text_match, label="generación proc.",
+            )
+
+        if ficha.get("nucleos_procesador") is not None:
+            candidates = _soft_filter(
+                candidates, applied, unverified,
+                requested=ficha["nucleos_procesador"], getter=lambda r: r["_nucleos"],
+                matcher=_numeric_match, label="núcleos",
+            )
 
         if not candidates:
             return [], "none", False, applied, unverified
@@ -352,9 +461,16 @@ class CMService:
             "modelo": row.get("modelo"),
             "tipo_equipo": row.get("tipo_equipo"),
             "procesador_principal": row.get("procesador_principal"),
+            "linea_procesador": row.get("linea_procesador"),
+            "generacion_procesador": row["_generacion"],
             "puntaje_passmark_cpu": row.get("puntaje_passmark_cpu"),
             "total_ram_gb": row.get("total_ram_gb"),
+            "tecnologia_ram": row["_tecnologia_ram"],
             "total_almacenamiento_gb": row.get("total_almacenamiento_gb"),
+            "tecnologia_disco_principal": row["_tecnologia_disco"],
+            "tipo_configuracion_discos": row["_config_discos"],
+            "tiene_gpu_dedicada": row["_gpu_dedicada"],
+            "gpu_dedicada_nombre": row.get("gpu_dedicada_nombre"),
             "sistema_operativo": row.get("sistema_operativo"),
             "wifi_generacion": row.get("wifi_generacion"),
             "peso_equipo": row.get("peso_equipo"),

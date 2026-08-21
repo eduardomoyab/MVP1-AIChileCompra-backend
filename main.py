@@ -3,12 +3,19 @@ main.py — Backend Asistente Compra Ágil
 FastAPI + HTTP SSE
 
 Endpoints:
-  POST /api/chat/{session_id}          → Chat streaming (SSE) — Computadores
-  POST /api/manual_update/{session_id} → Actualización manual de atributo (SSE)
-  POST /api/reset/{session_id}         → Resetear sesión
-  GET  /api/medicamentos/search        → Buscador de medicamentos (sin ficha/chat)
-  GET  /health                         → Estado del servicio
-  GET  /api/schema                     → Esquema de atributos y valores válidos
+  POST /api/chat/{session_id}                     → Chat streaming (SSE) — Computadores
+  POST /api/manual_update/{session_id}             → Actualización manual de atributo (SSE) — Computadores
+  POST /api/reset/{session_id}                     → Resetear sesión — Computadores
+  POST /api/medicamentos/analizar/{session_id}     → Análisis de texto libre por LLM (SSE) — Medicamentos
+  POST /api/medicamentos/manual_update/{session_id}→ Actualización manual de atributo (SSE) — Medicamentos
+  GET  /api/medicamentos/facets/{session_id}       → Valores reales+conteo de un atributo, acotados por lo ya elegido
+  GET  /api/medicamentos/precio_por_unidad/{session_id} → Precio (p25/mediana/p75) por cada unidad_venta -- para comparar antes de elegir
+  GET  /api/medicamentos/historial/{session_id}    → Compras anteriores acotadas (acordeón opcional)
+  POST /api/medicamentos/describe                  → Descripciones IA por requerimiento (para el PDF del carrito)
+  POST /api/medicamentos/reset/{session_id}        → Resetear sesión — Medicamentos
+  GET  /health                                     → Estado del servicio
+  GET  /api/schema                                 → Esquema de atributos y valores válidos — Computadores
+  GET  /api/medicamentos/schema                    → Esquema de atributos y valores válidos — Medicamentos
 """
 
 import os
@@ -28,6 +35,7 @@ from dotenv import load_dotenv
 
 from agents.attribute_matcher import AttributeMatcher
 from agents.ficha_agent import FichaAgent, FILLABLE_ATTRIBUTES
+from agents.medicamento_agent import MedicamentoAgent, FILLABLE_ATTRIBUTES_MED, CORE_ATTRS_MED
 from services.price_service import PriceService
 from services.cm_service import CMService
 from services import currency_service
@@ -53,6 +61,7 @@ medicamento_service = MedicamentoService()
 lgbm_service = LgbmPriceService()
 guardrail = GuardrailService()
 agent: FichaAgent = None
+medicamento_agent: MedicamentoAgent = None
 
 # Historial liviano por sesión para el guardrail (máx 20 mensajes por sesión)
 _session_histories: dict[str, list[dict]] = {}
@@ -87,8 +96,9 @@ async def get_user_email(x_user_email: Optional[str] = Depends(_user_email_heade
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global agent
+    global agent, medicamento_agent
     agent = FichaAgent(matcher)
+    medicamento_agent = MedicamentoAgent(matcher)
     lgbm_service._load()
     usage_service.ensure_table()
     analytics_service.ensure_table()
@@ -150,7 +160,8 @@ async def health():
 @app.get("/api/auth/check_access")
 async def check_access_endpoint(email: str, _: str = Depends(require_api_key)):
     allowed = await asyncio.to_thread(access_service.is_email_allowed, email)
-    return {"allowed": allowed}
+    sections = await asyncio.to_thread(access_service.get_allowed_sections, email) if allowed else []
+    return {"allowed": allowed, "sections": sections}
 
 
 # ─── Uso diario de tokens (panel de cuenta) ────────────────────────────────────
@@ -490,30 +501,250 @@ async def track_endpoint(
     return {"ok": True}
 
 
-# ─── Medicamentos (buscador, sin ficha ni chat) ────────────────────────────────
+# ─── Medicamentos: selector guiado de atributos (sin buscador de texto) ───────
 
-@app.get("/api/medicamentos/search")
-async def medicamentos_search_endpoint(
-    q: str = "",
-    laboratorio: Optional[str] = None,
-    forma_farmaceutica: Optional[str] = None,
-    concentracion: Optional[str] = None,
-    user_email: str = Depends(get_user_email),
-    _: str = Depends(require_api_key),
-):
-    result = await asyncio.to_thread(
-        medicamento_service.search,
-        q,
-        laboratorio,
-        forma_farmaceutica,
-        concentracion,
-        30,
-    )
-    analytics_service.log(session_id="", user_email=user_email, tipo="medicamento_search", user_msg=q)
+def _enrich_medicamentos(rows: list) -> list:
+    # Mismo patrón que _enrich_offers para Computadores: el enlace real a
+    # Mercado Público ("Detalle Compra Ágil") solo necesita codigo_requerimiento,
+    # que acá SÍ existe (100% de las filas, a diferencia de codigo_oc/OC_productos
+    # que no tiene calce para medicamentos -- por eso no hay "Ver OC" acá).
+    result = []
+    for row in rows:
+        codigos = row.get("codigos_requerimiento") or []
+        result.append({
+            **row,
+            "ca_urls": [f"{_CA_BUSCADOR_BASE}?code={c}" for c in codigos],
+        })
     return result
 
 
-# ─── Reset ────────────────────────────────────────────────────────────────────
+class MedicamentoAnalizarRequest(BaseModel):
+    texto: str
+
+class MedicamentoManualUpdateRequest(BaseModel):
+    attribute: str
+    value: Optional[Any] = None
+
+class DescribeItem(BaseModel):
+    texto_original: str
+    atributos: dict
+
+class DescribeRequest(BaseModel):
+    items: list[DescribeItem]
+
+
+@app.get("/api/medicamentos/schema")
+async def get_medicamentos_schema():
+    schema = {}
+    for attr, meta in FILLABLE_ATTRIBUTES_MED.items():
+        entry = {"description": meta["description"], "type": meta["type"]}
+        if meta["type"] == "dict":
+            entry["valid_values"] = matcher.get_valid_values("Medicamentos", attr)
+        schema[attr] = entry
+    return {"categoria": "Medicamentos", "attributes": schema, "core_attrs": CORE_ATTRS_MED}
+
+
+@app.post("/api/medicamentos/analizar/{session_id}")
+async def medicamentos_analizar_endpoint(
+    session_id: str,
+    body: MedicamentoAnalizarRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    texto = body.texto.strip()
+    if not texto:
+        async def empty():
+            yield sse({"type": "error", "message": "Texto vacío"})
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(empty(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    async def event_gen():
+        t0 = time.perf_counter()
+        try:
+            if await asyncio.to_thread(usage_service.is_blocked, user_email):
+                usage_info = await asyncio.to_thread(usage_service.get_usage, user_email)
+                yield sse({"type": "usage_limit_reached", "data": usage_service.to_public(usage_info)})
+                yield "data: [DONE]\n\n"
+                analytics_service.log(
+                    session_id=session_id, user_email=user_email, tipo="medicamento_usage_blocked",
+                    user_msg=texto, duration_ms=int((time.perf_counter() - t0) * 1000),
+                    blocked=True, block_reason="límite diario de tokens alcanzado",
+                )
+                return
+
+            result = await medicamento_agent.analyze(session_id, texto)
+
+            if result.get("ficha_updates"):
+                yield sse({"type": "ficha_update", "updates": result["ficha_updates"]})
+            if result.get("message"):
+                yield sse({"type": "message", "text": result["message"]})
+            if result.get("questions"):
+                yield sse({"type": "questions", "questions": result["questions"]})
+
+            price_found = False
+            ficha = medicamento_agent.get_ficha(session_id)
+            if ficha.get("principio_activo"):
+                try:
+                    price = await asyncio.to_thread(medicamento_service.estimate_price, ficha)
+                    if price:
+                        price_found = True
+                        yield sse({"type": "price_update", "data": price})
+                    else:
+                        yield sse({"type": "price_not_found"})
+                except Exception as e:
+                    logging.warning(f"Error en estimación de precio medicamentos: {e}")
+                    yield sse({"type": "price_not_found"})
+
+            yield "data: [DONE]\n\n"
+
+            usage = result.get("tokens")
+            ficha_updates = result.get("ficha_updates", [])
+            analytics_service.log(
+                session_id=session_id,
+                user_email=user_email,
+                tipo="medicamento_analizar",
+                user_msg=texto,
+                ai_msg=result.get("message", ""),
+                tokens_in=usage.prompt_tokens if usage else None,
+                tokens_out=usage.completion_tokens if usage else None,
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                n_updates=len(ficha_updates),
+                price_found=price_found,
+                model=medicamento_agent.model,
+                attrs_updated=",".join(u["attribute"] for u in ficha_updates) or None,
+            )
+            tokens_total = usage.total_tokens if usage else 0
+            await asyncio.to_thread(usage_service.add_usage, user_email, tokens_total)
+
+        except Exception as e:
+            logging.error(f"Error en medicamentos analizar SSE {session_id}: {e}", exc_info=True)
+            yield sse({"type": "error", "message": "Error interno del servidor"})
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+@app.post("/api/medicamentos/manual_update/{session_id}")
+async def medicamentos_manual_update_endpoint(
+    session_id: str,
+    body: MedicamentoManualUpdateRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    if not body.attribute:
+        async def err():
+            yield sse({"type": "error", "message": "Atributo requerido"})
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(err(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    async def event_gen():
+        t0 = time.perf_counter()
+        try:
+            result = medicamento_agent.apply_manual_update(session_id, body.attribute, body.value)
+
+            if result["updates"]:
+                yield sse({"type": "ficha_update", "updates": result["updates"]})
+
+            price_found = False
+            ficha = medicamento_agent.get_ficha(session_id)
+            if ficha.get("principio_activo"):
+                try:
+                    price = await asyncio.to_thread(medicamento_service.estimate_price, ficha)
+                    if price:
+                        price_found = True
+                        yield sse({"type": "price_update", "data": price})
+                    else:
+                        yield sse({"type": "price_not_found"})
+                except Exception as e:
+                    logging.warning(f"Error en estimación de precio medicamentos: {e}")
+                    yield sse({"type": "price_not_found"})
+
+            yield "data: [DONE]\n\n"
+
+            analytics_service.log(
+                session_id=session_id,
+                user_email=user_email,
+                tipo="medicamento_manual_update",
+                user_msg=f"{body.attribute}={body.value}",
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                n_updates=len(result.get("updates", [])),
+                price_found=price_found,
+                attrs_updated=body.attribute,
+            )
+
+        except Exception as e:
+            logging.error(f"Error en medicamentos manual_update SSE {session_id}: {e}", exc_info=True)
+            yield sse({"type": "error", "message": "Error interno"})
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+@app.get("/api/medicamentos/facets/{session_id}")
+async def get_medicamentos_facets(
+    session_id: str,
+    attr: str,
+    _: str = Depends(require_api_key),
+):
+    ficha = medicamento_agent.get_ficha(session_id)
+    values = await asyncio.to_thread(medicamento_service.get_facet_values, attr, ficha)
+    return {"attribute": attr, "values": values}
+
+
+@app.get("/api/medicamentos/precio_por_unidad/{session_id}")
+async def get_medicamentos_precio_por_unidad(
+    session_id: str,
+    _: str = Depends(require_api_key),
+):
+    ficha = medicamento_agent.get_ficha(session_id)
+    values = await asyncio.to_thread(medicamento_service.get_price_by_unidad, ficha)
+    return {"attribute": "unidad_venta", "values": values}
+
+
+@app.get("/api/medicamentos/companions/{session_id}")
+async def get_medicamentos_companions(session_id: str, _: str = Depends(require_api_key)):
+    ficha = medicamento_agent.get_ficha(session_id)
+    values = await asyncio.to_thread(medicamento_service.get_companion_values, ficha)
+    return {"attribute": "principio_activo", "values": values}
+
+
+@app.get("/api/medicamentos/historial/{session_id}")
+async def get_medicamentos_historial(
+    session_id: str,
+    sort: str = "fecha_desc",
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    ficha = medicamento_agent.get_ficha(session_id)
+    result = await asyncio.to_thread(medicamento_service.get_historial, ficha, sort, 30)
+    result["results"] = _enrich_medicamentos(result.get("results", []))
+    analytics_service.log(session_id=session_id, user_email=user_email, tipo="medicamento_ver_historial")
+    return result
+
+
+@app.post("/api/medicamentos/describe")
+async def medicamentos_describe_endpoint(
+    body: DescribeRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    items = [item.dict() for item in body.items]
+    if not items:
+        return {"descripciones": []}
+    descripciones = await medicamento_agent.describe_batch(items)
+    analytics_service.log(
+        session_id="", user_email=user_email, tipo="medicamento_pdf_describe", n_updates=len(items),
+    )
+    return {"descripciones": descripciones}
+
+
+@app.post("/api/medicamentos/reset/{session_id}")
+async def medicamentos_reset_endpoint(session_id: str, _: str = Depends(require_api_key)):
+    medicamento_agent.reset_session(session_id)
+    return {"type": "reset_ok"}
+
+
+# ─── Reset (Computadores) ──────────────────────────────────────────────────────
 
 @app.post("/api/reset/{session_id}")
 async def reset_endpoint(session_id: str, _: str = Depends(require_api_key)):

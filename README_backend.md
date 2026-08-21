@@ -1,6 +1,6 @@
 # Backend — Asistente IA Compras Públicas
 
-API REST con streaming SSE construida en **FastAPI**. Contiene toda la lógica de negocio, organizada por categoría: agente conversacional + normalización semántica vectorial (FAISS) + estimación de precio histórico para **Computadores**, y un buscador estructurado sobre historial de compras para **Medicamentos** (`MedicamentoService`). Incluye guardrail de seguridad para el chat.
+API REST con streaming SSE construida en **FastAPI**. Contiene toda la lógica de negocio, organizada por categoría: agente conversacional + normalización semántica vectorial (FAISS) + estimación de precio histórico para **Computadores** (chat), y un **selector guiado de atributos** por LLM + estimación de precio en vivo para **Medicamentos** (`MedicamentoAgent` + `MedicamentoService`, sin chat visible — un texto libre se analiza en una pasada y el resto es edición directa de atributos). Incluye guardrail de seguridad para el chat de Computadores.
 
 > Repositorio: `github.com/eduardomoyab/MVP1-AIChileCompra-backend` · versión `v1.0.0`
 
@@ -72,8 +72,14 @@ flowchart TD
 | `GET` | `/api/offers/{session_id}` | **Sí** | No | Historial de OC reales coincidentes |
 | `GET` | `/api/cm_offers/{session_id}` | **Sí** | No | Catálogo Convenio Marco coincidente |
 | `POST` | `/api/track/{session_id}` | **Sí** | No | Evento de analytics del frontend |
-| `POST` | `/api/reset/{session_id}` | **Sí** | No | Reiniciar sesión |
-| `GET` | `/api/medicamentos/search` | **Sí** | No | Buscador de medicamentos con filtros facetados (laboratorio, forma farmacéutica, concentración) — ver `MedicamentoService` |
+| `POST` | `/api/reset/{session_id}` | **Sí** | No | Reiniciar sesión — Computadores |
+| `GET` | `/api/medicamentos/schema` | No | No | Atributos válidos y valores permitidos — Medicamentos |
+| `POST` | `/api/medicamentos/analizar/{session_id}` | **Sí** | **SSE** | Analiza texto libre por LLM y sugiere atributos (una pasada, no conversación) |
+| `POST` | `/api/medicamentos/manual_update/{session_id}` | **Sí** | **SSE** | Edición manual de un atributo del requerimiento |
+| `GET` | `/api/medicamentos/facets/{session_id}` | **Sí** | No | Valores reales + conteo de un atributo, acotados por lo ya elegido |
+| `GET` | `/api/medicamentos/historial/{session_id}` | **Sí** | No | Compras anteriores acotadas por los atributos elegidos (acordeón opcional) |
+| `POST` | `/api/medicamentos/describe` | **Sí** | No | Descripción IA por requerimiento del carrito, en batch (para el PDF) |
+| `POST` | `/api/medicamentos/reset/{session_id}` | **Sí** | No | Reiniciar sesión — Medicamentos |
 
 Autenticación: header `x-api-key: <FRONTEND_API_KEY>`.
 
@@ -325,6 +331,18 @@ Los índices se construyen al inicio (background thread) y se persisten en `FAIS
 
 ---
 
+## Medicamentos: selector guiado de atributos
+
+A diferencia de Computadores, acá no hay chat: el usuario escribe una vez qué necesita ("Eutirox 100mg", "quitadol", una descripción larga) y `MedicamentoAgent` (GPT-4o-mini, una sola llamada no-streaming por texto — no hace falta ir emitiendo texto token a token porque no hay burbuja de chat) sugiere `principio_activo` (resolviendo marca comercial → principio activo real por conocimiento propio del modelo, nunca al revés), y `forma_farmaceutica`/`concentracion` solo si el texto los trae explícitos. El resto de la interacción es edición directa de atributos (`/api/medicamentos/manual_update`, sin LLM) con sugerencias en tiempo real desde `/api/medicamentos/facets` — valores realmente observados en la BD, acotados por lo que ya está elegido, no un diccionario fijo.
+
+`AttributeMatcher` normaliza `principio_activo`/`forma_farmaceutica`/`laboratorio` contra `attribute_dictionary.csv` (mismo mecanismo FAISS que Computadores, con filas `categoria=Medicamentos` generadas desde los valores reales de la vista `PrecioMedCA`, unificando `principio_activo_1`/`principio_activo_2` como una sola dimensión). `concentracion` **no** se normaliza por FAISS — es un valor+unidad con estructura numérica/ordinal, y la similitud de embeddings no distingue jerarquías numéricas de forma confiable (ver nota de `cm_service.py`); se maneja como texto libre + facetas reales.
+
+El precio se estima en vivo con `MedicamentoService.estimate_price()`: un solo rango de percentiles (P25/mediana/P75) sobre `PrecioMedCA` (`extractor_medicamentos` + `OfertaProducto` + `Oferta`, join 1:1) filtrado por los atributos ya elegidos — requiere al menos `principio_activo`. El historial de compras que respalda esa estimación es secundario y opcional (`GET /api/medicamentos/historial`), no la pantalla principal.
+
+El usuario arma varios requerimientos (uno por texto analizado) en un carrito de cotización en el frontend; al descargar el PDF, `POST /api/medicamentos/describe` genera — en una sola llamada batch — un párrafo de licitación por requerimiento, en tono de compra pública chilena y **sin mencionar marca comercial**.
+
+---
+
 ## Configuración (`.env`)
 
 | Variable | Default | Requerida | Descripción |
@@ -332,7 +350,8 @@ Los índices se construyen al inicio (background thread) y se persisten en `FAIS
 | `OPENAI_API_KEY` | — | **Sí** | Clave OpenAI para el agente y el guardrail |
 | `OPENAI_MODEL` | `gpt-4o-mini` | No | Modelo del agente conversacional (`FichaAgent`) |
 | `GUARDRAIL_MODEL` | `gpt-4o-mini` | No | Modelo del clasificador de seguridad |
-| `TEMPERATURE` | `0.2` | No | Temperatura del agente conversacional (no afecta al guardrail) |
+| `TEMPERATURE` | `0.2` | No | Temperatura del agente conversacional de Computadores (no afecta al guardrail) |
+| `MED_TEMPERATURE` | `0.2` | No | Temperatura del agente de Medicamentos (`MedicamentoAgent`) |
 | `DATABASE_URL` | — | **Sí** | URL PostgreSQL (`postgresql://user:pass@host:port/db`) |
 | `FRONTEND_API_KEY` | — | **Sí** | Clave compartida con el frontend para autenticar peticiones |
 | `ALLOWED_ORIGINS` | `http://localhost:5000` | No | Orígenes CORS (URL pública del frontend) |
