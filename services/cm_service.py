@@ -523,11 +523,24 @@ class CMService:
             "products": enriched[:top_n],
         }
 
-    def get_offer_rows(self, ficha: Dict[str, Any], limit: int = 30) -> List[Dict]:
+    def get_offer_rows(
+        self,
+        ficha: Dict[str, Any],
+        limit: int = 30,
+        price_min: Optional[int] = None,
+        price_max: Optional[int] = None,
+    ) -> List[Dict]:
         candidates, _match_type, _relaxed, _applied, _dyn_unverified = self._find_candidates(ficha)
         if not candidates:
             return []
         rate, _fx_date, _fx_fallback = get_usd_clp()
         enriched = [self._enrich(r, rate) for r in candidates]
+        # Filtro de precio opcional (ej. el usuario acota el rango esperado a
+        # su presupuesto real) -- se compara contra precio_min_clp, el mismo
+        # valor que se muestra y ordena en la tarjeta de cada producto.
+        if price_min is not None:
+            enriched = [r for r in enriched if r["precio_min_clp"] is not None and r["precio_min_clp"] >= price_min]
+        if price_max is not None:
+            enriched = [r for r in enriched if r["precio_min_clp"] is not None and r["precio_min_clp"] <= price_max]
         enriched.sort(key=lambda r: (r["precio_min_clp"] is None, r["precio_min_clp"]))
         return enriched[:limit]

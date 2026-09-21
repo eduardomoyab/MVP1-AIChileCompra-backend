@@ -22,6 +22,8 @@ from dotenv import load_dotenv
 
 from agents.attribute_matcher import AttributeMatcher
 from agents.processor_family import extract_linea_procesador
+from agents import convenio_marco_gamas
+from services import chat_session_service
 
 load_dotenv()
 
@@ -34,7 +36,6 @@ FILLABLE_ATTRIBUTES = {
         "type": "enum",
         "values": ["Laptop", "AIO", "Desktop", "Otro"],
     },
-    "marca": {"description": "Fabricante del equipo (ej: HP, Dell, Lenovo, Apple)", "type": "dict"},
     "nombre_modelo": {"description": "Nombre comercial completo del modelo (opcional)", "type": "free"},
     "procesador_principal": {
         "description": "Modelo completo del procesador (ej: Intel Core i5-1335U, AMD Ryzen 5 7530U)",
@@ -65,6 +66,7 @@ FILLABLE_ATTRIBUTES = {
         "description": "Nombre completo de la GPU dedicada (solo si tiene_gpu_dedicada=true)",
         "type": "dict",
     },
+    "marca": {"description": "Fabricante del EQUIPO/laptop-desktop (ej: HP, Dell, Lenovo, Apple, Acer) — NUNCA el fabricante del procesador (Intel/AMD no son valores válidos acá, esos van en procesador_principal/linea_procesador). Opcional, no preguntar salvo que el usuario lo mencione (ver regla de neutralidad de marca)", "type": "dict"},
     "pantalla_pulgadas": {
         "description": "Tamaño diagonal de pantalla en pulgadas (ej: 14.0, 15.6, 27.0)",
         "type": "numeric",
@@ -103,8 +105,40 @@ COMPLEMENT_ONLY_ATTRIBUTES = {
 
 _SEPARATOR = "§§§"
 
+# Bajo esta longitud, no se confía en el matching por embeddings (ver
+# memoria "embeddings no discriminan CPU" -- strings cortas y ambiguas
+# pueden dar score alto contra un vecino sin relación real).
+_MIN_NORMALIZE_LEN = 4
 
-def _build_system_prompt() -> str:
+
+def _gama_section_text() -> str:
+    """Bloque completo de "RECONOCIMIENTO DE GAMA" -- se arma aparte (no
+    directo en el f-string del prompt) porque es opcional: solo se agrega
+    cuando el mensaje del turno actual realmente menciona una gama (ver
+    convenio_marco_gamas.mentions_gama() y su uso en _build_system_prompt).
+    La tabla de gamas en sí ronda ~500 tokens -- no vale la pena mandarla en
+    cada turno si la mayoría de los mensajes no tienen nada que ver con eso."""
+    gamas_convenio_marco = convenio_marco_gamas.format_for_prompt()
+    return f"""## RECONOCIMIENTO DE GAMA (Convenio Marco vigente)
+
+Si el usuario menciona una "gama" (ej. "laptop gama 1", "necesito algo de gama alta", "equipo gama 3"), reconócelo como un criterio de primer nivel — no lo ignores ni lo trates como si solo hubiera dicho el tipo de equipo. Traduce el término a la gama oficial (2, 3 o 4) y llena la ficha con el PISO MÍNIMO exacto de esa gama, indicando en tu mensaje que son las especificaciones mínimas del Convenio Marco vigente (no una estimación tuya):
+
+{gamas_convenio_marco}
+
+Sinónimos → gama oficial: "básica"/"entrada"/"baja" ≈ por debajo de Gama 2 (este convenio NO define una Gama 1 oficial para Laptop/Desktop/AIO — no inventes specs para "gama 1"; en ese caso trátalo como el nivel de uso más básico posible, igual que "oficina básico" en la tabla de uso más abajo, y acláraselo al usuario). "media"/"intermedia" = Gama 2. "alta"/"avanzada" = Gama 3. "premium"/"workstation" = Gama 4 (solo existe para Desktop en este convenio).
+
+Si la combinación tipo_equipo+gama que pide el usuario no está en la tabla (ej. "AIO gama 4", que no existe en este convenio), dilo explícitamente en vez de inventar una fila que no existe, y ofrece la gama más cercana disponible.
+
+Ejemplo:
+Usuario: "necesito laptops gama 2 para la oficina"
+Con la Gama 2 del Convenio Marco vigente, estas son las especificaciones mínimas: procesador Intel Core i5 o AMD Ryzen 5, 16 GB de RAM, 960 GB SSD NVMe, Windows 11 Pro.
+{_SEPARATOR}
+{{"ficha_updates": {{"tipo_equipo": "Laptop", "linea_procesador": ["Intel Core i5", "AMD Ryzen 5"], "total_ram_gb": 16, "total_almacenamiento_gb": 960, "tecnologia_disco_principal": "NVMe SSD", "sistema_operativo": "Microsoft Windows 11 Pro"}}, "questions": []}}
+
+"""
+
+
+def _build_system_prompt(include_gama: bool = True) -> str:
     attr_table = []
     for atr, meta in FILLABLE_ATTRIBUTES.items():
         if meta["type"] == "enum":
@@ -121,6 +155,10 @@ def _build_system_prompt() -> str:
         attr_table.append(f"- **{atr}**: {meta['description']} → {tipo}")
 
     attrs_str = "\n".join(attr_table)
+    gama_section = _gama_section_text() if include_gama else ""
+    gama2_summary = convenio_marco_gamas.format_gama_summary(2)
+    gama3_summary = convenio_marco_gamas.format_gama_summary(3)
+    gama4_summary = convenio_marco_gamas.format_gama_summary(4)
 
     return f"""Eres un asistente que ayuda a funcionarios de compras públicas chilenos a preparar fichas técnicas para la plataforma Compra Ágil del Mercado Público.
 
@@ -155,13 +193,18 @@ Equivalencias de gama (cualquiera de las dos cumple el mismo nivel de rendimient
 - Alta (desarrollo intensivo, edición, análisis de datos): Intel Core i7 / AMD Ryzen 7
 - Premium (workstation, deep learning, render 3D): Intel Core i9 / AMD Ryzen 9
 
-Esta regla **NO aplica** si el usuario ya mencionó una marca de procesador o de equipo (ej. "que sea Intel", "prefiero un Lenovo con Intel", "quiero AMD") — ahí se respeta su elección (Regla 0) y se usa solo esa marca.
+Esta regla **NO aplica** si el usuario ya mencionó un fabricante de procesador o de equipo (ej. "que sea Intel", "prefiero un Lenovo con Intel", "quiero AMD") — ahí se respeta su elección (Regla 0) y se usa solo esa opción.
+
+**Tampoco aplica si `marca` ya es Apple**: los Mac actuales no traen procesador Intel ni AMD (usan Apple Silicon, familia M — M1/M2/M3/M4...). Si el equipo es Apple, sugiere directamente una línea Apple M de la gama adecuada, nunca la tabla de equivalencias Intel/AMD de abajo.
+
+**Cuidado — error real observado**: "Intel"/"AMD" son fabricantes de PROCESADOR, nunca van en el atributo `marca` (que es el fabricante del EQUIPO: HP, Lenovo, Acer, Dell, Apple...). Si el usuario dice "quiero AMD" o "prefiero Intel" sin mencionar una marca de equipo, eso llena `linea_procesador`, y el atributo `marca` se deja como está (vacío si no se ha dicho nada de marca de equipo). Nunca escribas "AMD" o "Intel" como valor de `marca`.
 
 Ejemplos:
 - "solo Office, nada exigente" (uso definido, sin marca) → `{{"linea_procesador": ["Intel Core i3", "AMD Ryzen 3"]}}`  ✓
 - "algo de gama media, no me importa la marca" → `{{"linea_procesador": ["Intel Core i5", "AMD Ryzen 5"]}}`  ✓
 - "quiero que sea Intel" → `{{"linea_procesador": "Intel Core i5"}}`  ✓  (marca explícita, no se agrega AMD)
-- "prefiero AMD" → `{{"linea_procesador": "AMD Ryzen 5"}}`  ✓  (idem)
+- "prefiero AMD" → `{{"linea_procesador": "AMD Ryzen 5"}}`  ✓  (idem — NUNCA `{{"marca": "AMD"}}`)
+- "quiero AMD" → `{{"marca": "AMD"}}`  ✗ PROHIBIDO — AMD no es una marca de equipo
 
 ## REGLA MÚLTIPLES VALORES Y RANGOS
 
@@ -224,11 +267,12 @@ Señales de que el input es una descripción técnica:
 
 - Si el usuario no mencionó el uso, pregunta exclusivamente por eso en ese turno.
 - Sin conocer el uso, NO completes RAM, almacenamiento, procesador ni GPU. Solo puedes inferir tipo_equipo si es muy obvio.
-- Una vez que el usuario dé un uso inicial, **sigue haciendo preguntas de seguimiento** para afinar el perfil funcional. No llenes la ficha hasta tener claridad suficiente.
+- Una vez que el usuario dé un uso inicial, **sigue haciendo preguntas de seguimiento** para afinar el perfil funcional, PERO SOLO MIENTRAS el usuario siga respondiéndolas — apenas deje pasar una sin contestarla (condición 3 abajo), se acabaron las preguntas de seguimiento para siempre en esa conversación, aunque sientas que "afinarías mejor" el perfil con una más.
 
 **Cuándo dejar de preguntar y llenar la ficha** (basta con UNA de estas condiciones):
 1. Tienes suficiente contexto para determinar con confianza las especificaciones adecuadas (conoces el uso, la intensidad y los programas principales).
 2. El usuario indica explícitamente que ya entregó suficiente información (frases como "con eso basta", "ya es suficiente", "listo", "procede", "con eso nomás").
+3. **Tu turno anterior incluyó una pregunta de seguimiento (cualquiera, no solo la de uso general) y el mensaje MÁS RECIENTE del usuario no la contestó** — cambió de tema, agregó otro requisito distinto, o simplemente no tocó lo que preguntaste. Da igual si mencionó algo nuevo y relevante (ej. batería, portabilidad, presupuesto): si no respondió tu pregunta puntual, esa pregunta queda cerrada YA, en ESTE MISMO turno — no la repitas, no la reformules, no hagas otra pregunta de seguimiento distinta para "seguir afinando". Llena los atributos pendientes con el mínimo razonable para el uso ya conocido, y de paso registra lo nuevo que el usuario sí mencionó. Una sola vez sin respuesta directa es SIEMPRE suficiente para activar esta condición — no hace falta que el usuario la ignore dos veces.
 
 **Preguntas de seguimiento útiles según el uso declarado:**
 - Oficina: ¿usa programas específicos además de Office? ¿maneja bases de datos, macros complejas o muchos archivos abiertos?
@@ -237,17 +281,55 @@ Señales de que el input es una descripción técnica:
 - Análisis de datos: ¿trabaja con modelos de ML, datasets grandes o solo Excel/Power BI?
 - Educación/terreno: ¿lo usará en campo sin enchufe constante? ¿necesita ser portátil y liviano?
 
-## ESPECIFICACIONES MÍNIMAS SEGÚN USO
+{gama_section}## ESPECIFICACIONES MÍNIMAS SEGÚN USO
 
-Usa siempre el mínimo adecuado. No pongas más de lo necesario.
+Usa siempre el mínimo adecuado. No pongas más de lo necesario. Cuando el uso declarado corresponda razonablemente a una Gama oficial del Convenio Marco vigente, usa esa Gama como base (mismos valores que en RECONOCIMIENTO DE GAMA, no inventes otros números) y dilo explícitamente en tu mensaje — igual que si el usuario hubiera pedido la gama directamente. Si después el usuario pide algo puntual distinto a lo que sugiere la gama, respeta lo que pide (Regla 0) por sobre la gama — la gama es solo el punto de partida.
 
-- **Trabajo de oficina básico** (Word, Excel, correo, navegación): 8 GB RAM, 256 GB disco, sin GPU dedicada
-- **Trabajo de oficina con programas exigentes** (Excel con macros complejas, muchas aplicaciones abiertas a la vez, bases de datos): 16 GB RAM, 256-512 GB disco, sin GPU dedicada
-- **Programación y desarrollo de software** (IDEs, compiladores, servidores locales): 16 GB RAM, 512 GB disco, sin GPU dedicada
-- **Diseño gráfico y edición de fotos** (Photoshop, Illustrator, Canva Pro): 16 GB RAM, 512 GB disco, sin GPU dedicada
-- **Edición de video, animación o trabajo en 3D**: 32 GB RAM, 1000 GB disco, con GPU dedicada
-- **Análisis de datos o inteligencia artificial**: 32 GB RAM, 512 GB disco, GPU dedicada opcional
+**No te olvides de `tipo_equipo` (causa de bugs reales — la estimación de precio depende de este atributo y nunca aparece si falta):** si el mismo mensaje donde describe el uso también dice o deja claro el tipo de equipo ("laptop", "notebook", "desktop", "PC de escritorio", "all-in-one", "AIO"), inclúyelo en `ficha_updates` en ESE MISMO turno, junto con las specs de la gama — no dejes que la atención en mapear RAM/procesador/disco de la gama te haga olvidar este atributo, que es independiente y tan importante como los demás.
+
+- **Trabajo de oficina básico** (Word, Excel, correo, navegación): por debajo de la Gama 2 oficial — 8 GB RAM, 256 GB disco, sin GPU dedicada. Es una estimación propia, no una gama oficial (el Convenio Marco no define una Gama 1 para este uso tan liviano); acláraselo al usuario igual que en RECONOCIMIENTO DE GAMA.
+- **Trabajo de oficina con programas exigentes / Programación y desarrollo de software / Diseño gráfico y edición de fotos**: equivale a **Gama 2** del Convenio Marco vigente — {gama2_summary}.
+- **Edición de video/animación/3D / Análisis de datos o inteligencia artificial**: equivale a **Gama 3** del Convenio Marco vigente — {gama3_summary}. Si además necesita GPU dedicada fuerte y el equipo es un Desktop, ofrece **Gama 4** en su lugar — {gama4_summary} (Gama 4 solo existe para Desktop en este convenio; para Laptop/AIO no hay equivalente oficial a ese nivel, quedate en Gama 3 y aclara que la GPU dedicada sería una adición propia, no parte de una gama oficial).
 - **Uso mixto o sin especificar**: 8 GB RAM, 256 GB disco (pide aclaración)
+
+Al sugerir specs por gama en esta sección (no porque el usuario haya dicho "gama X", sino porque el uso descrito calza con una), responde en el mismo estilo que RECONOCIMIENTO DE GAMA: cita que son las especificaciones de esa Gama del Convenio Marco vigente, no una estimación tuya.
+
+Ejemplo (falla real observada — evítala): usuario menciona el tipo de equipo Y el uso en el mismo mensaje, sin ser una descripción técnica estructurada (eso sería REGLA DESCRIPCIÓN TÉCNICA, prioridad aún mayor):
+Usuario: "Laptops para trabajo de oficina básico con excel y python avanzado"
+Para ese uso, que incluye Excel y programación avanzada, te recomendaría especificaciones de Gama 2 del Convenio Marco vigente: procesador Intel Core i5 o AMD Ryzen 5, 16 GB de RAM y 960 GB de almacenamiento SSD NVMe.
+{_SEPARATOR}
+{{"ficha_updates": {{"tipo_equipo": "Laptop", "linea_procesador": ["Intel Core i5", "AMD Ryzen 5"], "total_ram_gb": 16, "total_almacenamiento_gb": 960, "tecnologia_disco_principal": "NVMe SSD"}}, "questions": []}}
+✗ INCORRECTO: el mismo `ficha_updates` sin `"tipo_equipo": "Laptop"` — el usuario ya lo dijo explícitamente ("Laptops"), no hay excusa para no registrarlo en ese mismo turno.
+
+## REGLA ANTI-REPETICIÓN (crítica — causa de bugs reales — LEER ANTES DE CADA PREGUNTA)
+
+**Prohibido preguntar por el uso/propósito del equipo ("¿para qué se usará?" o cualquier reformulación de esa pregunta) más de UNA VEZ en toda la conversación.** Antes de escribir tu pregunta, haz este chequeo obligatorio: busca en TODO el historial (todos los turnos, no solo el último mensaje del usuario) si el usuario ya mencionó, en cualquier momento, para qué es el equipo (oficina, programación, diseño, gama de uso, programas que usará, etc.) o si TÚ mismo ya lo escribiste en un mensaje tuyo anterior (ej. "para el trabajo de oficina básico, puedo recomendarte..."). Si aparece en cualquiera de los dos, el uso YA ESTÁ RESUELTO — no existe ninguna razón para volver a preguntarlo, sin importar cuántos turnos intermedios hayan sido sobre otra cosa (una pregunta al asistente, un pedido que no puedes cumplir, quejas del usuario, etc.).
+
+Esto aplica a CUALQUIER dato, no solo al uso: nunca repitas una pregunta ya hecha ni pidas un dato que ya aparece en el historial, en ningún turno, por lejano que sea.
+
+Qué hacer en vez de repetir:
+- Si aún falta precisión (ej. sabes que es "oficina básico" pero no los programas exactos), pregunta ESO específicamente — nunca vuelvas a la pregunta general de uso.
+- Si el usuario está evadiendo tu pregunta pendiente o insiste en que le des las especificaciones ya, deja de insistir: llena la ficha con el nivel mínimo que corresponda al uso general ya conocido (ver tabla de especificaciones mínimas), aunque no tengas el detalle fino de programas. Es mejor completar con un estimado razonable que repetir la misma pregunta una tercera vez.
+
+**REGLA DE UNA SOLA OPORTUNIDAD (endurecida — aplica a CUALQUIER pregunta específica, no solo a la de uso general):** una pregunta específica tuya (ej. "¿qué programas usarán?", "¿maneja bases de datos?", "¿necesita ser portátil?") se considera **descartada para siempre** apenas ocurra CUALQUIERA de estas dos cosas — no hace falta que el usuario insista dos veces, con la PRIMERA vez ya basta:
+1. El usuario responde el turno siguiente sin abordar esa pregunta en absoluto (cambia de tema, hace una pregunta distinta, pide otra cosa, o da una respuesta vaga tipo "lo básico nomás" sin el dato puntual que pediste).
+2. El usuario dice explícitamente que no sabe, que no importa, o que sigas sin eso ("no sé", "da igual", "lo que sea mejor", "sigamos").
+
+Una vez descartada, esa pregunta NUNCA MÁS se vuelve a hacer en la conversación, bajo ninguna forma ni reformulación, sin importar cuántos turnos pasen ni de qué se hable después. En su lugar, llena ese atributo con el mínimo razonable para el uso ya conocido en el MISMO turno en que la descartas — no esperes a que el usuario "insista" una segunda o tercera vez, una sola omisión ya es suficiente para dejar de preguntar.
+
+Ejemplo (falla real observada — evítala, incluso varios turnos después):
+Turno 1 — Usuario: "Laptops para trabajo de oficina básico"
+Turno 2 — Usuario: "¿me indicas qué laptop gama 1 hay en Convenio Marco?" (pregunta distinta)
+Turno 3 — Usuario: "pero necesito que me describas las especificaciones técnicas" (insiste, sin dar más detalle)
+✗ INCORRECTO en el turno 3: "necesito saber para qué se usará el equipo" — el uso YA se declaró en el turno 1, y ya lo reconociste tú mismo en tu respuesta del turno 2. Repetirlo en el turno 3 es el bug.
+✓ CORRECTO en el turno 3: como el usuario insiste y no da más detalle de programas, llena la ficha con el mínimo de oficina básico (8 GB RAM, 256 GB disco, sin GPU dedicada) en ese mismo turno, en vez de preguntar una tercera vez.
+
+Ejemplo (regla de una sola oportunidad, sobre una pregunta de seguimiento — no la de uso general):
+Turno 1 — Usuario: "necesito una laptop para programar"
+Tu turno: "¿qué lenguajes o tecnologías usan? ¿corren servidores locales o contenedores?"
+Turno 2 — Usuario: "también necesito que tenga buena batería" (no contesta la pregunta, cambia de tema)
+✗ INCORRECTO más adelante: volver a preguntar "¿qué lenguajes/tecnologías usan?" en cualquier turno posterior — ya se omitió una vez, queda descartada para siempre.
+✓ CORRECTO en el turno 2: reconoce el pedido de batería, y llena procesador/RAM/disco con el mínimo razonable para programación general (ver tabla), sin volver a preguntar por lenguajes específicos en ningún turno futuro.
 
 ## REGLA ANTI-PROMESA (crítica — causa de bugs reales)
 
@@ -261,6 +343,19 @@ Perfecto, especificaciones registradas.
 {{"ficha_updates": {{"total_ram_gb": 32, "total_almacenamiento_gb": 512}}, "questions": []}}
 
 De hecho, evita el patrón "¿te gustaría que proceda?" en primer lugar: si ya tienes contexto suficiente (Regla de comportamiento 1), llena directamente en el mismo turno en que lo recomiendas, sin pedir permiso para hacerlo.
+
+## REGLA DE BORRADO (crítica — causa de bugs reales)
+
+Cuando el usuario pida **quitar, borrar, eliminar o limpiar** uno o más atributos ya registrados (ej. "borra todas las otras características", "elimina el procesador que pusiste", "deja solo el tipo de equipo, nada más"), tenés que incluir cada atributo a borrar en `ficha_updates` con valor `null` explícito, EN ESE MISMO TURNO — la misma lógica de la REGLA ANTI-PROMESA aplica acá: si tu mensaje dice que borraste algo, `ficha_updates` tiene que reflejarlo, nunca quedar vacío.
+
+Diferencia clave: **omitir** una clave en `ficha_updates` significa "no toco este atributo" (se mantiene como está); **incluirla con `null`** significa "bórralo". Nunca confundas ambos casos.
+
+Para saber QUÉ atributos borrar cuando el usuario pide algo genérico ("borra todo lo demás", "deja solo laptop"), revisá lo que ya registraste en tus propios turnos anteriores de esta conversación y listá ahí, con `null`, todo lo que esté lleno salvo lo que el usuario pidió conservar.
+
+Ejemplo (ya registraste tipo_equipo=Laptop, linea_procesador, total_ram_gb=16, total_almacenamiento_gb=960, tecnologia_disco_principal, sistema_operativo; usuario: "elimina los otros atributos, solo deja laptop"):
+Listo, dejé solo el tipo de equipo como laptop y borré el resto de las especificaciones.
+{_SEPARATOR}
+{{"ficha_updates": {{"linea_procesador": null, "total_ram_gb": null, "total_almacenamiento_gb": null, "tecnologia_disco_principal": null, "sistema_operativo": null}}, "questions": []}}
 
 ## REGLAS DE COMPORTAMIENTO
 
@@ -282,7 +377,7 @@ Responde SIEMPRE con este formato exacto, nada más:
 {_SEPARATOR}
 {{"ficha_updates": {{...}}, "questions": [...]}}
 
-- **ficha_updates**: solo los atributos que puedes determinar con confianza. Omite los que no conoces.
+- **ficha_updates**: solo los atributos que puedes determinar con confianza. Omite los que no conoces. Para BORRAR un atributo ya registrado, inclúyelo con valor `null` explícito (ver REGLA DE BORRADO) — omitirlo no lo borra, solo lo deja como está.
 - **questions**: máximo UNA pregunta (lista vacía [] si no necesitas más info).
 - Para numéricos: solo el número, sin unidad. Ej: 8, no "8 GB".
 - Para booleanos: true o false (sin comillas).
@@ -322,9 +417,24 @@ _sessions: Dict[str, Dict] = {}
 
 def _get_session(session_id: str) -> Dict:
     if session_id not in _sessions:
+        # Sesión no vista todavía por ESTE proceso -- puede ser porque el
+        # usuario cambió a una conversación distinta desde el sidebar, porque
+        # recargó la página, o porque el backend se reinició. En todos los
+        # casos, si había una conversación guardada para este session_id en
+        # Postgres, se recupera acá -- ficha Y el hilo conversacional (para
+        # que el LLM no pierda contexto ni repita preguntas ya respondidas).
+        # Los turnos bloqueados por el guardrail se excluyen a propósito: ese
+        # texto nunca llegó al agente en su momento (ver chat_endpoint en
+        # main.py), así que tampoco corresponde re-sembrarlo acá.
+        state = chat_session_service.get_agent_state(session_id)
+        history = [
+            {"role": m["role"], "content": m["content"]}
+            for m in state["messages"]
+            if not m.get("blocked") and m.get("role") in ("user", "assistant")
+        ]
         _sessions[session_id] = {
-            "history": [],
-            "ficha": {},
+            "history": history,
+            "ficha": state["ficha"],
         }
     return _sessions[session_id]
 
@@ -337,9 +447,20 @@ class FichaAgent:
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.temperature = float(os.getenv("TEMPERATURE", "0.2"))
         self.matcher = matcher
-        self._system_prompt = _build_system_prompt()
+        # Dos variantes precalculadas -- la sección de gamas del Convenio
+        # Marco (~500 tokens) solo se manda cuando el mensaje del turno
+        # actual realmente menciona una gama (ver _pick_system_prompt).
+        # No vale la pena pagar ese costo en cada mensaje si la mayoría no
+        # tiene nada que ver con eso.
+        self._system_prompt_full = _build_system_prompt(include_gama=True)
+        self._system_prompt_base = _build_system_prompt(include_gama=False)
 
-    async def stream_process_message(self, session_id: str, user_content: str):
+    def _pick_system_prompt(self, user_content: str) -> str:
+        if convenio_marco_gamas.mentions_gama(user_content):
+            return self._system_prompt_full
+        return self._system_prompt_base
+
+    async def stream_process_message(self, session_id: str, user_content: str, user_email: str = ""):
         """
         Async generator.
         Yields ("chunk", str)  — fragmento de texto del mensaje del asistente.
@@ -352,7 +473,7 @@ class FichaAgent:
         """
         session = _get_session(session_id)
         session["history"].append({"role": "user", "content": user_content})
-        messages = [{"role": "system", "content": self._system_prompt}] + session["history"]
+        messages = [{"role": "system", "content": self._pick_system_prompt(user_content)}] + session["history"]
 
         try:
             stream = await self.client.chat.completions.create(
@@ -441,7 +562,23 @@ class FichaAgent:
         complement_updates = []
 
         for attr, value in raw_updates.items():
-            if value is None or attr in COMPLEMENT_ONLY_ATTRIBUTES:
+            if attr in COMPLEMENT_ONLY_ATTRIBUTES:
+                continue
+            if value is None:
+                # El modelo incluyó el atributo explícitamente con valor null --
+                # es un pedido de BORRAR ese campo (REGLA DE BORRADO), distinto
+                # de "no tengo un valor" (eso se representa omitiendo la clave,
+                # ver más abajo). Mismo criterio que apply_manual_update() para
+                # ediciones manuales.
+                if session["ficha"].get(attr) is not None:
+                    session["ficha"][attr] = None
+                    ficha_updates.append({
+                        "attribute": attr,
+                        "value": None,
+                        "source": "ai",
+                        "normalized": True,
+                        "score": 1.0,
+                    })
                 continue
             normalized_value, score, _ = self._normalize(attr, value)
             ficha_updates.append({
@@ -476,6 +613,9 @@ class FichaAgent:
                     })
                     session["ficha"]["linea_procesador"] = linea
 
+        if ficha_updates or complement_updates:
+            chat_session_service.save_ficha(session_id, user_email, session["ficha"])
+
         yield ("done", {
             "message": msg_text,
             "ficha_updates": ficha_updates,
@@ -499,7 +639,7 @@ class FichaAgent:
         session = _get_session(session_id)
         session["history"].append({"role": "user", "content": user_content})
 
-        messages = [{"role": "system", "content": self._system_prompt}] + session["history"]
+        messages = [{"role": "system", "content": self._pick_system_prompt(user_content)}] + session["history"]
 
         try:
             response = await self.client.chat.completions.create(
@@ -533,9 +673,20 @@ class FichaAgent:
         complement_updates = []
 
         for attr, value in raw_updates.items():
-            if value is None:
-                continue
             if attr in COMPLEMENT_ONLY_ATTRIBUTES:
+                continue
+            if value is None:
+                # Ver comentario equivalente en stream_process_message() --
+                # null explícito = borrar el campo, no "sin valor".
+                if session["ficha"].get(attr) is not None:
+                    session["ficha"][attr] = None
+                    ficha_updates.append({
+                        "attribute": attr,
+                        "value": None,
+                        "source": "ai",
+                        "normalized": True,
+                        "score": 1.0,
+                    })
                 continue
 
             normalized_value, score, candidates = self._normalize(attr, value)
@@ -580,7 +731,7 @@ class FichaAgent:
         }
 
     def apply_manual_update(
-        self, session_id: str, attribute: str, value: Any
+        self, session_id: str, attribute: str, value: Any, user_email: str = ""
     ) -> Dict[str, Any]:
         """
         Procesa una actualización manual del usuario en la ficha.
@@ -625,7 +776,7 @@ class FichaAgent:
             session["ficha"][comp_attr] = comp_val
 
         if attribute == "procesador_principal" and isinstance(normalized_value, str):
-            linea = _extract_linea_procesador(normalized_value)
+            linea = extract_linea_procesador(normalized_value)
             if linea:
                 complement_updates.append({
                     "attribute": "linea_procesador",
@@ -652,13 +803,11 @@ class FichaAgent:
                         "triggered_value": None,
                     })
 
+        chat_session_service.save_ficha(session_id, user_email, session["ficha"])
         return {"updates": updates, "complement_updates": complement_updates}
 
     def get_ficha(self, session_id: str) -> Dict[str, Any]:
         return _get_session(session_id)["ficha"].copy()
-
-    def reset_session(self, session_id: str) -> None:
-        _sessions[session_id] = {"history": [], "ficha": {}}
 
     def cleanup_session(self, session_id: str) -> None:
         _sessions.pop(session_id, None)
@@ -690,6 +839,15 @@ class FichaAgent:
 
         # Para atributos de diccionario: FAISS
         if attr_type == "dict":
+            # Strings muy cortas/ambiguas (ej. "m1", "i5") no son seguras de
+            # normalizar por similitud semántica -- la evidencia empírica de
+            # este proyecto (ver memoria "embeddings no discriminan CPU")
+            # muestra que el embedding puede dar un score alto a un vecino
+            # sin relación real cuando el texto de entrada es muy corto. Se
+            # deja el valor tal cual (bug real observado: "m1" terminó
+            # normalizado a "AMD" en procesador_principal).
+            if len(value.strip()) < _MIN_NORMALIZE_LEN:
+                return value, 0.0, []
             return self.matcher.normalize(CATEGORIA, attribute, value)
 
         return value, 1.0, []

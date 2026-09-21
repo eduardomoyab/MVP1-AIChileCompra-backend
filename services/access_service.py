@@ -96,6 +96,33 @@ def get_allowed_sections(email: str) -> Optional[List[str]]:
         return []
 
 
+def is_admin(email: str) -> bool:
+    """True si el correo pertenece al grupo llamado exactamente 'Admins'
+    dentro de mvp1-compra-agil (panel_admin.application_groups) — mismo
+    grupo que ya administra db-admin-panel, no hay un rol de "admin"
+    aparte. Falla cerrado (False) ante cualquier error/desconexión."""
+    engine = _get_engine()
+    if not engine or not email:
+        return False
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT 1 FROM panel_admin.application_users au
+                    JOIN panel_admin.applications a ON a.id = au.application_id
+                    JOIN panel_admin.application_groups g ON g.id = au.group_id
+                    WHERE a.slug = :slug AND au.email = :email AND g.nombre = 'Admins'
+                    """
+                ),
+                {"slug": _APPLICATION_SLUG, "email": email.strip().lower()},
+            ).fetchone()
+            return row is not None
+    except Exception as e:
+        logging.warning(f"[access] Error consultando si '{email}' es admin: {e}")
+        return False
+
+
 def get_daily_limit(email: str) -> Optional[int]:
     """Tope diario de tokens configurado para este correo en
     panel_admin.application_users, administrado desde "Aplicaciones" en

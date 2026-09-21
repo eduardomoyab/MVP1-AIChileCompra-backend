@@ -50,6 +50,24 @@ PRICE_QUERY_COLS = [
     "sistema_operativo",
 ]
 
+# Orden de relajación cuando el match exacto (todos los PRICE_QUERY_COLS
+# presentes en la ficha, en AND) da 0 filas -- se sueltan de a uno, del
+# menos al más determinante, hasta encontrar al menos 1 resultado.
+# tipo_equipo, total_ram_gb y total_almacenamiento_gb NUNCA se sueltan (no
+# están en esta lista): son los que más definen el precio real.
+_RELAX_ORDER = [
+    "sistema_operativo",
+    "tecnologia_ram",
+    "tecnologia_disco_principal",
+    "tipo_configuracion_discos",
+    "generacion_procesador",
+    "nucleos_procesador",
+    "marca",
+    "linea_procesador",
+    "procesador_principal",
+    "tiene_gpu_dedicada",
+]
+
 # Columnas disponibles para dropdowns: (nombre_ficha, columna_db)
 DROPDOWN_DB_COLS = [
     ("marca",                  "marca"),
@@ -338,15 +356,47 @@ class PriceService:
             return None
 
         result = _percentile_query(table, where_clauses, params)
-
         if result is _DB_ERROR:
             logging.warning("[PrecioCA] Error de conexión al estimar precio")
             return None
 
+        attrs_used = current_attrs
+        relaxed_attrs: List[str] = []
+
+        # Match exacto con TODOS los atributos dio 0 filas -- a más specs
+        # detalladas, más fácil que la intersección caiga a 0 (bug real
+        # reportado: specs generales sí traían precio, specs detalladas no).
+        # Se sueltan atributos de a uno, del menos al más determinante,
+        # hasta encontrar al menos 1 resultado -- mismo espíritu que la
+        # relajación de procesador que ya existe en cm_service.py, adaptado
+        # a que acá el filtro es un WHERE de SQL, no una lista en memoria.
+        if result is None:
+            attrs_used = dict(current_attrs)
+            for attr in _RELAX_ORDER:
+                if attr not in attrs_used:
+                    continue
+                attrs_used.pop(attr)
+                relaxed_attrs.append(attr)
+                where_clauses, params = _build_where(attrs_used)
+                if not where_clauses:
+                    result = None
+                    break
+                result = _percentile_query(table, where_clauses, params)
+                if result is _DB_ERROR:
+                    logging.warning("[PrecioCA] Error de conexión al relajar la búsqueda")
+                    return None
+                if result is not None:
+                    break
+
         if isinstance(result, dict):
-            result["match_attrs"] = list(current_attrs.keys())
+            result["match_attrs"] = list(attrs_used.keys())
             result["match_level"] = 1
-            result["match_description"] = _describe_attrs(current_attrs)
+            result["relaxed"] = bool(relaxed_attrs)
+            result["relaxed_attrs"] = relaxed_attrs
+            description = _describe_attrs(attrs_used)
+            if relaxed_attrs:
+                description += f" (búsqueda ampliada, se soltó: {_describe_attrs({a: None for a in relaxed_attrs})})"
+            result["match_description"] = description
             result["currency"] = "CLP"
             return result
 
@@ -358,6 +408,50 @@ class PriceService:
             return _dropdown_cache
         _dropdown_cache = self._fetch_dropdown_values()
         return _dropdown_cache
+
+    def get_filtered_dropdown_values(self, field: str, marca: Optional[str] = None, tipo_equipo: Optional[str] = None) -> List[str]:
+        """Igual que get_dropdown_values(), pero acotado a un solo campo y
+        filtrado por marca/tipo_equipo -- para editores de atributo que ya
+        saben qué equipo se está armando (ej. no mostrar procesadores AMD/
+        Intel al editar un equipo Apple). Sin caché (es específico por
+        ficha), pero acotado a un solo campo así que es una consulta liviana."""
+        table = _resolve_table_name()
+        col = dict(DROPDOWN_DB_COLS).get(field)
+        if not table or not col or (not marca and not tipo_equipo):
+            return []
+        engine = _get_engine()
+        if not engine:
+            return []
+
+        where_clauses = [
+            f"{col} IS NOT NULL",
+            f"TRIM({col}::text) != ''",
+            "LOWER(COALESCE(es_accesorio::text,'false')) != 'true'",
+        ]
+        params = {}
+        if marca:
+            where_clauses.append("marca ILIKE :marca")
+            params["marca"] = marca
+        if tipo_equipo:
+            where_clauses.append("tipo_equipo ILIKE :tipo_equipo")
+            params["tipo_equipo"] = tipo_equipo
+
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text(f"""
+                    SELECT DISTINCT {col}::text
+                    FROM "{table}"
+                    WHERE {' AND '.join(where_clauses)}
+                """), params).fetchall()
+            values = [r[0] for r in rows if r[0]]
+            if col in _DICT_NORMALIZED_COLS:
+                values = _normalize_dropdown_values(col, values)
+            values = _dedupe_casing(values)
+            values.sort()
+            return values
+        except Exception as e:
+            logging.warning(f"[Dropdowns] Error filtrando '{field}' por marca={marca!r}: {e}")
+            return []
 
     def _fetch_dropdown_values(self) -> Dict[str, List]:
         table = _resolve_table_name()
@@ -407,13 +501,119 @@ class PriceService:
         _dropdown_cache = self._fetch_dropdown_values()
 
 
+    def get_methodology(self, ficha: Dict[str, Any], relaxed_attrs: Optional[List[str]] = None) -> Optional[Dict]:
+        """Resumen de trazabilidad de la estimación -- cuántas transacciones
+        la sustentan, de qué período y qué tipo de organismos compraron.
+        Se calcula sobre el conjunto COMPLETO que calza con la ficha (no
+        solo las hasta 30 filas que devuelve get_offer_rows() para listar),
+        para que el número de transacciones y el período sean exactos y no
+        dependan del límite de paginación del historial.
+
+        relaxed_attrs: mismos atributos que estimate() soltó para esta ficha
+        (result["relaxed_attrs"], cacheado por sesión en main.py). Si no se
+        pasa el mismo relajo acá, esta consulta usa el ficha completo sin
+        relajar -- mismatch real detectado: estimate() decía "77 ofertas"
+        (contando con búsqueda relajada) mientras este método, consultado con
+        todos los atributos exactos, daba 0 -- el usuario veía "77 ofertas"
+        arriba y "sin transacciones" en el historial al mismo tiempo."""
+        table = _resolve_table_name()
+        if not table or not ficha.get("tipo_equipo"):
+            return None
+        current_attrs = {
+            col: ficha[col]
+            for col in PRICE_QUERY_COLS
+            if ficha.get(col) is not None
+        }
+        for attr in relaxed_attrs or []:
+            current_attrs.pop(attr, None)
+        where_clauses, params = _build_where(current_attrs)
+        if not where_clauses:
+            return None
+        where_sql = " AND ".join(where_clauses)
+
+        try:
+            engine = _get_engine()
+            with engine.connect() as conn:
+                summary = conn.execute(
+                    text(f"""
+                        SELECT
+                            COUNT(*) AS n,
+                            MIN(fecha_modificacion)::text AS fecha_min,
+                            MAX(fecha_modificacion)::text AS fecha_max
+                        FROM "{table}"
+                        WHERE
+                            LOWER(COALESCE(es_accesorio::text,'false')) != 'true'
+                            AND precio_unitario::numeric > 200000
+                            AND precio_unitario::numeric < 5000000
+                            AND {where_sql}
+                    """),
+                    params,
+                ).fetchone()
+
+                if not summary or not summary[0]:
+                    return None
+
+                # LEFT JOIN -- toda transacción cuenta en el total aunque su
+                # requerimiento/comprador no haya calzado en el join (esos
+                # caen en el balde "No identificado" en vez de perderse).
+                # "actividad_unidad_de_compra" es texto libre (código de
+                # actividad económica del comprador, no una taxonomía de
+                # organismo público) con cientos de variantes ruidosas --
+                # se agrupa por palabra clave en unas pocas categorías
+                # reconocibles en vez de mostrar el valor crudo.
+                org_rows = conn.execute(
+                    text(f"""
+                        SELECT
+                            CASE
+                                WHEN act IS NULL OR act IN ('', '-') THEN 'No identificado'
+                                WHEN act ~* 'MUNICIPAL' THEN 'Municipalidades'
+                                WHEN act ~* 'UNIVERSIDAD|EDUCACI[OÓ]N SUPERIOR|FORMACI[OÓ]N T[EÉ]CNICA' THEN 'Universidades / educación superior'
+                                WHEN act ~* 'SALUD|HOSPITAL|CL[IÍ]NICA' THEN 'Salud'
+                                WHEN act ~* 'ENSE[NÑ]ANZA|ESCOLAR|EDUCACI[OÓ]N' THEN 'Educación escolar'
+                                WHEN act ~* 'GOBIERNO|MINISTERIO|ADMINISTRACI[OÓ]N P[UÚ]BLICA|SERVICIO P[UÚ]BLICO|^GORE$|DELEGACI[OÓ]N PRESIDENCIAL' THEN 'Gobierno central / adm. pública'
+                                ELSE 'Otros organismos'
+                            END AS tipo_organismo,
+                            COUNT(*) AS n
+                        FROM (
+                            SELECT pca.codigo_requerimiento,
+                                   NULLIF(UPPER(TRIM(SPLIT_PART(c.actividad_unidad_de_compra, '|', 1))), '') AS act
+                            FROM "{table}" pca
+                            LEFT JOIN "Requerimiento" r ON r.codigo_requerimiento = pca.codigo_requerimiento
+                            LEFT JOIN "Comprador" c ON c.org_code = r.org_code AND c.ent_code = r.ent_code
+                            WHERE
+                                LOWER(COALESCE(pca.es_accesorio::text,'false')) != 'true'
+                                AND pca.precio_unitario::numeric > 200000
+                                AND pca.precio_unitario::numeric < 5000000
+                                AND {where_sql}
+                        ) sub
+                        GROUP BY 1
+                        ORDER BY 2 DESC
+                    """),
+                    params,
+                ).fetchall()
+
+            return {
+                "count": int(summary[0]),
+                "fecha_min": str(summary[1])[:10] if summary[1] else None,
+                "fecha_max": str(summary[2])[:10] if summary[2] else None,
+                "organismos": [{"tipo": r[0], "count": int(r[1])} for r in org_rows],
+            }
+        except Exception as e:
+            logging.warning(f"[get_methodology] Error: {e}")
+            return None
+
     def get_offer_rows(
         self,
         ficha: Dict[str, Any],
         limit: int = 30,
         price_min: Optional[int] = None,
         price_max: Optional[int] = None,
+        relaxed_attrs: Optional[List[str]] = None,
     ) -> List[Dict]:
+        """relaxed_attrs: ver docstring de get_methodology() -- mismo
+        mismatch real detectado (estimate() relaja para encontrar 77
+        ofertas, pero esta lista, sin el mismo relajo, filtraba con
+        atributos exactos y devolvía 0 filas)."""
         table = _resolve_table_name()
         if not table or not ficha.get("tipo_equipo"):
             return []
@@ -422,6 +622,8 @@ class PriceService:
             for col in PRICE_QUERY_COLS
             if ficha.get(col) is not None
         }
+        for attr in relaxed_attrs or []:
+            current_attrs.pop(attr, None)
         where_clauses, params = _build_where(current_attrs)
         if not where_clauses:
             return []
@@ -441,7 +643,30 @@ class PriceService:
                 fecha_modificacion::text,
                 id_oferta_aquiles,
                 codigo_oc,
-                razon_social_ganador
+                razon_social_ganador,
+                marca,
+                procesador_principal,
+                total_ram_gb,
+                tecnologia_ram,
+                total_almacenamiento_gb,
+                tecnologia_disco_principal,
+                tiene_gpu_dedicada,
+                sistema_operativo,
+                tipo_equipo,
+                linea_producto,
+                nombre_modelo,
+                linea_procesador,
+                generacion_procesador,
+                hilos_procesador,
+                frecuencia_turbo_procesador_mhz,
+                frecuencia_ram_mhz,
+                tipo_configuracion_discos,
+                gpu_dedicada_nombre,
+                total_vram_gpu_gb,
+                tecnologia_gpu_principal,
+                pantalla_pulgadas,
+                wifi_generacion,
+                part_number
             FROM "{table}"
             WHERE
                 LOWER(COALESCE(es_accesorio::text,'false')) != 'true'
@@ -454,17 +679,53 @@ class PriceService:
         try:
             engine = _get_engine()
             with engine.connect() as conn:
-                rows = conn.execute(sql, params).fetchall()
+                rows = conn.execute(sql, params).mappings().fetchall()
             return [
                 {
-                    "codigo_requerimiento": row[0],
-                    "precio_unitario":      int(row[1]) if row[1] else None,
-                    "precio_unitario_iva":  int(row[2]) if row[2] else None,
-                    "descripcion":          row[3],
-                    "fecha_modificacion":   str(row[4])[:10] if row[4] else None,
-                    "id_oferta_aquiles":    int(row[5]) if row[5] is not None else None,
-                    "codigo_oc":            row[6],
-                    "razon_social":         row[7],
+                    "codigo_requerimiento": row["codigo_requerimiento"],
+                    "precio_unitario":      int(row["precio_unitario"]) if row["precio_unitario"] else None,
+                    "precio_unitario_iva":  int(row["precio_unitario_iva"]) if row["precio_unitario_iva"] else None,
+                    "descripcion":          row["descripcion"],
+                    "fecha_modificacion":   str(row["fecha_modificacion"])[:10] if row["fecha_modificacion"] else None,
+                    "id_oferta_aquiles":    int(row["id_oferta_aquiles"]) if row["id_oferta_aquiles"] is not None else None,
+                    "codigo_oc":            row["codigo_oc"],
+                    "razon_social":         row["razon_social_ganador"],
+                    # Specs estructuradas (misma tabla que ya se usa para el
+                    # match de precio -- ver PRICE_QUERY_COLS/_build_where.
+                    # Ya vienen como texto formateado (ej. "16 GB"), no
+                    # requieren conversión. El primer grupo (marca...SO) se
+                    # usa para el comparador (mismo shape que Convenio
+                    # Marco); el segundo grupo (tipo_equipo en adelante) es
+                    # solo para el detalle expandible de cada tarjeta --
+                    # atributos reales de la tabla que no se piden al armar
+                    # la ficha pero sí sirven para ver el equipo completo
+                    # (se excluyen a propósito columnas administrativas como
+                    # es_accesorio/ROWNUM/unidad_venta, y resolucion_pantalla
+                    # _pixeles, que viene como total de píxeles sin ancho x
+                    # alto y no es legible para una persona).
+                    "marca":                        row["marca"],
+                    "procesador_principal":         row["procesador_principal"],
+                    "total_ram_gb":                 row["total_ram_gb"],
+                    "tecnologia_ram":               row["tecnologia_ram"],
+                    "total_almacenamiento_gb":      row["total_almacenamiento_gb"],
+                    "tecnologia_disco_principal":   row["tecnologia_disco_principal"],
+                    "tiene_gpu_dedicada":           row["tiene_gpu_dedicada"],
+                    "sistema_operativo":            row["sistema_operativo"],
+                    "tipo_equipo":                  row["tipo_equipo"],
+                    "linea_producto":               row["linea_producto"],
+                    "nombre_modelo":                row["nombre_modelo"],
+                    "linea_procesador":              row["linea_procesador"],
+                    "generacion_procesador":        row["generacion_procesador"],
+                    "hilos_procesador":              row["hilos_procesador"],
+                    "frecuencia_turbo_procesador_mhz": row["frecuencia_turbo_procesador_mhz"],
+                    "frecuencia_ram_mhz":            row["frecuencia_ram_mhz"],
+                    "tipo_configuracion_discos":     row["tipo_configuracion_discos"],
+                    "gpu_dedicada_nombre":           row["gpu_dedicada_nombre"],
+                    "total_vram_gpu_gb":             row["total_vram_gpu_gb"],
+                    "tecnologia_gpu_principal":      row["tecnologia_gpu_principal"],
+                    "pantalla_pulgadas":             row["pantalla_pulgadas"],
+                    "wifi_generacion":               row["wifi_generacion"],
+                    "part_number":                   row["part_number"],
                 }
                 for row in rows
             ]

@@ -5,7 +5,12 @@ FastAPI + HTTP SSE
 Endpoints:
   POST /api/chat/{session_id}                     → Chat streaming (SSE) — Computadores
   POST /api/manual_update/{session_id}             → Actualización manual de atributo (SSE) — Computadores
-  POST /api/reset/{session_id}                     → Resetear sesión — Computadores
+  GET  /api/sessions                               → Lista de conversaciones del usuario (sidebar) — Computadores
+  GET  /api/sessions/{session_id}                  → Ficha+mensajes+carrito+precio de una conversación — Computadores
+  POST /api/sessions/{session_id}/rename           → Renombrar conversación — Computadores
+  POST /api/sessions/{session_id}/delete           → Eliminar conversación — Computadores
+  GET  /api/compare/{session_id}                   → Carrito de comparación de esa conversación — Computadores
+  POST /api/compare/{session_id}                   → Guardar carrito de comparación de esa conversación — Computadores
   POST /api/medicamentos/analizar/{session_id}     → Análisis de texto libre por LLM (SSE) — Medicamentos
   POST /api/medicamentos/manual_update/{session_id}→ Actualización manual de atributo (SSE) — Medicamentos
   GET  /api/medicamentos/facets/{session_id}       → Valores reales+conteo de un atributo, acotados por lo ya elegido
@@ -43,7 +48,9 @@ from services.lgbm_price_service import LgbmPriceService
 from services.guardrail_service import GuardrailService
 from services import analytics_service
 from services import access_service
+from services import admin_service
 from services import usage_service
+from services import chat_session_service
 from services.medicamento_service import MedicamentoService
 
 load_dotenv()
@@ -94,6 +101,16 @@ async def get_user_email(x_user_email: Optional[str] = Depends(_user_email_heade
     return (x_user_email or "").strip().lower()
 
 
+async def require_admin(
+    user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+) -> str:
+    """Gate de los endpoints /api/admin/* -- el correo debe pertenecer al
+    grupo 'Admins' de mvp1-compra-agil (ver access_service.is_admin)."""
+    if not await asyncio.to_thread(access_service.is_admin, user_email):
+        raise HTTPException(status_code=403, detail="No tienes acceso al panel de administrador")
+    return user_email
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global agent, medicamento_agent
@@ -102,6 +119,7 @@ async def lifespan(app: FastAPI):
     lgbm_service._load()
     usage_service.ensure_table()
     analytics_service.ensure_table()
+    chat_session_service.ensure_table()
     logging.info("Servidor listo — construyendo índices FAISS y dropdowns en background...")
     asyncio.create_task(asyncio.to_thread(matcher.warm))
     asyncio.create_task(asyncio.to_thread(price_service.warmup_dropdowns))
@@ -161,7 +179,8 @@ async def health():
 async def check_access_endpoint(email: str, _: str = Depends(require_api_key)):
     allowed = await asyncio.to_thread(access_service.is_email_allowed, email)
     sections = await asyncio.to_thread(access_service.get_allowed_sections, email) if allowed else []
-    return {"allowed": allowed, "sections": sections}
+    is_admin = await asyncio.to_thread(access_service.is_admin, email) if allowed else False
+    return {"allowed": allowed, "sections": sections, "is_admin": is_admin}
 
 
 # ─── Uso diario de tokens (panel de cuenta) ────────────────────────────────────
@@ -170,6 +189,139 @@ async def check_access_endpoint(email: str, _: str = Depends(require_api_key)):
 async def usage_endpoint(user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)):
     usage = await asyncio.to_thread(usage_service.get_usage, user_email)
     return usage_service.to_public(usage)
+
+
+# ─── Comparador de candidatos (persistencia por conversación) ─────────────────
+# El comparador de equipos (ver 1.3 en la bitácora) vivía en memoria del
+# navegador y luego por usuario a secas -- ahora es por conversación, como el
+# resto de lo que compone una sesión de chat (ver chat_session_service.py).
+# El frontend manda la lista completa de candidatos ya normalizada (ver
+# _candidateFromCA/_candidateFromCM en app.js), acá solo se guarda/devuelve
+# tal cual, sin reconstruir nada.
+
+class CompareSaveRequest(BaseModel):
+    items: list
+
+@app.get("/api/compare/{session_id}")
+async def get_compare_endpoint(
+    session_id: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+):
+    session = await asyncio.to_thread(chat_session_service.get_full_session, session_id, user_email)
+    return {"items": session["compare_items"] if session else []}
+
+@app.post("/api/compare/{session_id}")
+async def save_compare_endpoint(
+    session_id: str,
+    body: CompareSaveRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    await asyncio.to_thread(chat_session_service.save_compare_items, session_id, user_email, body.items)
+    return {"ok": True}
+
+
+# ─── Conversaciones (sidebar, Computadores) ────────────────────────────────────
+# Reemplaza el modelo de "una sola sesión que se pisa con el botón Nueva
+# sesión" por varias conversaciones guardadas por usuario -- ficha, mensajes
+# del chat y carrito de comparación, todo scoped al session_id de cada una
+# (chat_session_service.py) y nunca visible entre usuarios distintos
+# (ownership check por email en cada lectura/escritura). El precio (Compra
+# Ágil y Convenio Marco) NUNCA se persiste -- se recalcula en caliente acá
+# mismo a partir de la ficha, igual que tras cada turno de chat.
+
+class RenameSessionRequest(BaseModel):
+    title: str
+
+
+def _recompute_prices(session_id: str, ficha: dict) -> tuple[Optional[dict], Optional[dict]]:
+    price_data = None
+    cm_price_data = None
+    if not ficha.get("tipo_equipo"):
+        return None, None
+    try:
+        price_data = price_service.estimate(ficha)
+        if price_data:
+            _session_price_cache[session_id] = price_data
+        else:
+            _session_price_cache.pop(session_id, None)
+    except Exception as e:
+        logging.warning(f"Error en estimación de precio (sessions): {e}")
+    try:
+        cm_price_data = cm_service.estimate(ficha)
+        if cm_price_data:
+            _session_cm_price_cache[session_id] = cm_price_data
+        else:
+            _session_cm_price_cache.pop(session_id, None)
+    except Exception as e:
+        logging.warning(f"Error en estimación de precio Convenio Marco (sessions): {e}")
+    return price_data, cm_price_data
+
+
+@app.get("/api/sessions")
+async def list_sessions_endpoint(user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)):
+    sessions = await asyncio.to_thread(chat_session_service.list_sessions, user_email)
+    return {"sessions": sessions}
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session_endpoint(
+    session_id: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+):
+    session = await asyncio.to_thread(chat_session_service.get_full_session, session_id, user_email)
+    if not session:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada")
+
+    # Re-sembrar el contexto del LLM (ficha + historial) en memoria, para que
+    # el agente siga la conversación sin perder contexto tras el cambio.
+    ficha = await asyncio.to_thread(agent.get_ficha, session_id)
+
+    # Re-sembrar el historial liviano del guardrail (incluye turnos
+    # bloqueados, que el agente principal nunca vio pero el guardrail sí
+    # necesita para la REGLA DE CONTEXTO).
+    history = [
+        {"role": m["role"], "content": m["content"][:400] if m["role"] == "assistant" else m["content"]}
+        for m in session["messages"]
+        if m.get("role") in ("user", "assistant")
+    ]
+    _session_histories[session_id] = history[-_HISTORY_MAX:]
+
+    price_data, cm_price_data = await asyncio.to_thread(_recompute_prices, session_id, ficha)
+
+    return {
+        "title": session["title"],
+        "ficha": ficha,
+        "messages": session["messages"],
+        "compare_items": session["compare_items"],
+        "price_data": price_data,
+        "cm_price_data": cm_price_data,
+    }
+
+
+@app.post("/api/sessions/{session_id}/rename")
+async def rename_session_endpoint(
+    session_id: str,
+    body: RenameSessionRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    ok = await asyncio.to_thread(chat_session_service.rename, session_id, user_email, body.title)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada")
+    return {"ok": True}
+
+
+@app.post("/api/sessions/{session_id}/delete")
+async def delete_session_endpoint(
+    session_id: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+):
+    ok = await asyncio.to_thread(chat_session_service.delete, session_id, user_email)
+    agent.cleanup_session(session_id)
+    _session_histories.pop(session_id, None)
+    _session_price_cache.pop(session_id, None)
+    _session_cm_price_cache.pop(session_id, None)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada")
+    return {"ok": True}
 
 
 # ─── Schema ───────────────────────────────────────────────────────────────────
@@ -200,6 +352,22 @@ async def get_dropdowns():
     for attr in _DICT_DROPDOWN_ATTRS:
         db_values[attr] = matcher.get_valid_values("Computadores", attr)
     return db_values
+
+
+@app.get("/api/dropdowns/filtered")
+async def get_filtered_dropdown(
+    field: str,
+    marca: Optional[str] = None,
+    tipo_equipo: Optional[str] = None,
+):
+    """Opciones de un solo campo acotadas por marca/tipo_equipo -- para que
+    el editor de Procesador (u otro atributo correlacionado con la marca) no
+    ofrezca combinaciones que no existen en la realidad (ej. procesadores
+    AMD/Intel para un equipo Apple)."""
+    values = await asyncio.to_thread(
+        price_service.get_filtered_dropdown_values, field, marca, tipo_equipo
+    )
+    return {"values": values}
 
 
 # ─── Chat (SSE) ───────────────────────────────────────────────────────────────
@@ -241,12 +409,20 @@ async def chat_endpoint(
 
             # ── Guardrail: validar mensaje antes de procesarlo ──────────────
             history = _session_histories.get(session_id, [])
-            allowed, block_reason, clean_message, guardrail_usage = await guardrail.check(content, history)
+            allowed, block_reason, clean_message, friendly_reply, guardrail_usage = await guardrail.check(content, history)
             guardrail_tokens = guardrail_usage.total_tokens if guardrail_usage else 0
 
             if not allowed:
                 logging.info(f"[guardrail] Bloqueado session={session_id}: {block_reason}")
-                yield sse({"type": "blocked", "message": block_reason})
+                # El mensaje "message" acá es friendly_reply -- una respuesta
+                # conversacional (la escribe el mismo clasificador), no el
+                # motivo interno de bloqueo. El frontend la muestra como un
+                # turno normal del chat, no como el antiguo cartel fijo de
+                # "Consulta fuera del ámbito" que cortaba la conversación.
+                # El texto original del usuario NUNCA llega al agente
+                # principal en este caso -- esa sigue siendo la capa de
+                # seguridad real; lo único que cambió es cómo se comunica.
+                yield sse({"type": "blocked", "message": friendly_reply})
                 yield "data: [DONE]\n\n"
                 analytics_service.log(
                     session_id=session_id,
@@ -257,8 +433,27 @@ async def chat_endpoint(
                     blocked=True,
                     block_reason=block_reason,
                 )
+                # Se guarda en el historial liviano del guardrail (no en el
+                # del agente principal) para que la REGLA DE CONTEXTO pueda
+                # seguir reconociendo referencias a este intercambio en el
+                # turno siguiente (ej. "por qué no puedes ayudarme con eso").
+                history.append({"role": "user", "content": content})
+                history.append({"role": "assistant", "content": friendly_reply})
+                if len(history) > _HISTORY_MAX:
+                    history = history[-_HISTORY_MAX:]
+                _session_histories[session_id] = history
                 # El guardrail igual gastó tokens aunque el mensaje se bloqueara.
                 await asyncio.to_thread(usage_service.add_usage, user_email, guardrail_tokens)
+                # Transcript limpio para el sidebar -- el turno bloqueado
+                # también se muestra (con blocked=true) aunque nunca haya
+                # llegado al agente principal.
+                await asyncio.to_thread(
+                    chat_session_service.append_messages, session_id, user_email,
+                    [
+                        {"role": "user", "content": content, "blocked": True},
+                        {"role": "assistant", "content": friendly_reply, "blocked": True},
+                    ],
+                )
                 return
 
             # Usar la versión limpia si el guardrail extrajo solo la parte válida
@@ -275,13 +470,23 @@ async def chat_endpoint(
             yield sse({"type": "thinking"})
 
             result = {}
-            async for event_type, event_data in agent.stream_process_message(session_id, effective_content):
+            async for event_type, event_data in agent.stream_process_message(session_id, effective_content, user_email):
                 if event_type == "chunk":
                     yield sse({"type": "assistant_chunk", "delta": event_data})
                 elif event_type == "done":
                     result = event_data
 
             yield sse({"type": "assistant_done"})
+
+            # Transcript limpio para el sidebar (se guarda el texto original
+            # del usuario, no la versión limpiada por el guardrail).
+            await asyncio.to_thread(
+                chat_session_service.append_messages, session_id, user_email,
+                [
+                    {"role": "user", "content": content},
+                    {"role": "assistant", "content": result.get("message", "")},
+                ],
+            )
 
             # Registrar respuesta del asistente para contexto futuro del guardrail
             if result.get("message"):
@@ -372,7 +577,7 @@ async def manual_update_endpoint(
     async def event_gen():
         t0 = time.perf_counter()
         try:
-            result = agent.apply_manual_update(session_id, body.attribute, body.value)
+            result = agent.apply_manual_update(session_id, body.attribute, body.value, user_email)
 
             if result["updates"]:
                 yield sse({"type": "ficha_update", "updates": result["updates"]})
@@ -454,6 +659,8 @@ def _enrich_offers(rows: list) -> list:
 @app.get("/api/offers/{session_id}")
 async def get_offers_endpoint(
     session_id: str,
+    price_min: Optional[int] = None,
+    price_max: Optional[int] = None,
     user_email: str = Depends(get_user_email),
     _: str = Depends(require_api_key),
 ):
@@ -461,18 +668,47 @@ async def get_offers_endpoint(
     if not ficha.get("tipo_equipo"):
         return {"offers": []}
 
-    cached = _session_price_cache.get(session_id, {})
-    p25 = cached.get("p25")
-    p75 = cached.get("p75")
+    # Mismos atributos que se relajaron para llegar al precio ya mostrado
+    # (cacheado en /api/chat al llamar price_service.estimate()) -- si no se
+    # aplica el mismo relajo acá, esta lista filtra con la ficha completa sin
+    # relajar y puede devolver 0 filas mientras el panel de precio, arriba,
+    # sigue mostrando el conteo relajado (bug real: "77 ofertas" arriba,
+    # "sin transacciones" en el historial, al mismo tiempo).
+    relaxed_attrs = _session_price_cache.get(session_id, {}).get("relaxed_attrs")
 
-    rows = await asyncio.to_thread(price_service.get_offer_rows, ficha, 30, p25, p75)
+    # Sin filtro por default -- se muestran TODAS las transacciones que
+    # calzan con la ficha (antes se acotaba en silencio al rango p25-p75,
+    # lo que hacía parecer que había menos evidencia de la que en realidad
+    # hay). Solo se acota si el usuario aplicó su propio filtro de precio
+    # (price_min/price_max en la query, ver sección 3.2 del feedback).
+    rows = await asyncio.to_thread(price_service.get_offer_rows, ficha, 30, price_min, price_max, relaxed_attrs)
     analytics_service.log(session_id=session_id, user_email=user_email, tipo="ver_historial")
     return {"offers": _enrich_offers(rows)}
+
+
+@app.get("/api/price_methodology/{session_id}")
+async def get_price_methodology_endpoint(
+    session_id: str,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    """Trazabilidad de la estimación de Compra Ágil: cantidad de
+    transacciones, período y desagregación por tipo de organismo -- sobre
+    el conjunto COMPLETO que calza con la ficha, no solo la página de hasta
+    30 filas que se lista en /api/offers."""
+    ficha = agent.get_ficha(session_id)
+    if not ficha.get("tipo_equipo"):
+        return {"methodology": None}
+    relaxed_attrs = _session_price_cache.get(session_id, {}).get("relaxed_attrs")
+    data = await asyncio.to_thread(price_service.get_methodology, ficha, relaxed_attrs)
+    return {"methodology": data}
 
 
 @app.get("/api/cm_offers/{session_id}")
 async def get_cm_offers_endpoint(
     session_id: str,
+    price_min: Optional[int] = None,
+    price_max: Optional[int] = None,
     user_email: str = Depends(get_user_email),
     _: str = Depends(require_api_key),
 ):
@@ -480,7 +716,7 @@ async def get_cm_offers_endpoint(
     if not ficha.get("tipo_equipo"):
         return {"offers": []}
 
-    rows = await asyncio.to_thread(cm_service.get_offer_rows, ficha, 30)
+    rows = await asyncio.to_thread(cm_service.get_offer_rows, ficha, 30, price_min, price_max)
     analytics_service.log(session_id=session_id, user_email=user_email, tipo="ver_catalogo_cm")
     return {"offers": rows}
 
@@ -744,15 +980,154 @@ async def medicamentos_reset_endpoint(session_id: str, _: str = Depends(require_
     return {"type": "reset_ok"}
 
 
-# ─── Reset (Computadores) ──────────────────────────────────────────────────────
+# ─── Administración (grupos, usuarios, tokens, módulos) ───────────────────────
+# Administra las MISMAS tablas de panel_admin que ya usa db-admin-panel (ver
+# access_service.py / admin_service.py) -- un cambio hecho acá se ve
+# reflejado allá y viceversa, misma fuente de verdad. Todo gateado por
+# require_admin (correo en el grupo 'Admins' de mvp1-compra-agil).
 
-@app.post("/api/reset/{session_id}")
-async def reset_endpoint(session_id: str, _: str = Depends(require_api_key)):
-    agent.reset_session(session_id)
-    _session_histories.pop(session_id, None)
-    _session_price_cache.pop(session_id, None)
-    _session_cm_price_cache.pop(session_id, None)
-    return {"type": "reset_ok"}
+class AdminSectionRequest(BaseModel):
+    slug: str
+    nombre: str
+
+class AdminLimitRequest(BaseModel):
+    daily_token_limit: Optional[str] = None
+    unlimited: bool = False
+
+class AdminUserRequest(AdminLimitRequest):
+    email: str
+
+class AdminToggleRequest(BaseModel):
+    enabled: bool
+
+class AdminGroupRequest(AdminLimitRequest):
+    nombre: str
+
+class AdminGroupMembersRequest(BaseModel):
+    emails: str
+
+
+def _admin_error_response(e: admin_service.AdminServiceError):
+    raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/admin/overview")
+async def admin_overview_endpoint(_: str = Depends(require_admin)):
+    sections = await asyncio.to_thread(admin_service.list_sections)
+    users = await asyncio.to_thread(admin_service.list_users_with_sections)
+    groups = await asyncio.to_thread(admin_service.list_groups)
+
+    # Consumo real de hoy por usuario -- no vive en panel_admin (esquema
+    # administrado desde db-admin-panel), sino en la tabla daily_usage
+    # propia de MVP1 (ver usage_service.py). Valor agregado respecto al
+    # otro panel, que solo puede mostrar el tope configurado, no el gasto.
+    for u in users:
+        usage = await asyncio.to_thread(usage_service.get_usage, u["email"])
+        u["tokens_used_today"] = usage["tokens_used"]
+
+    group_members = {}
+    for g in groups:
+        group_members[g["id"]] = await asyncio.to_thread(admin_service.list_group_members, g["id"])
+
+    return {"sections": sections, "users": users, "groups": groups, "group_members": group_members}
+
+
+@app.post("/api/admin/sections")
+async def admin_create_section(body: AdminSectionRequest, _: str = Depends(require_admin)):
+    try:
+        await asyncio.to_thread(admin_service.create_section, body.slug, body.nombre)
+    except admin_service.AdminServiceError as e:
+        _admin_error_response(e)
+    return {"ok": True}
+
+
+@app.post("/api/admin/sections/{section_id}/delete")
+async def admin_delete_section(section_id: int, _: str = Depends(require_admin)):
+    await asyncio.to_thread(admin_service.delete_section, section_id)
+    return {"ok": True}
+
+
+@app.post("/api/admin/users")
+async def admin_add_user(body: AdminUserRequest, user_email: str = Depends(require_admin)):
+    try:
+        await asyncio.to_thread(
+            admin_service.add_user, body.email, body.daily_token_limit, body.unlimited, user_email
+        )
+    except admin_service.AdminServiceError as e:
+        _admin_error_response(e)
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{user_id}/limit")
+async def admin_update_user_limit(user_id: int, body: AdminLimitRequest, _: str = Depends(require_admin)):
+    try:
+        await asyncio.to_thread(admin_service.update_user_limit, user_id, body.daily_token_limit, body.unlimited)
+    except admin_service.AdminServiceError as e:
+        _admin_error_response(e)
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{user_id}/delete")
+async def admin_remove_user(user_id: int, _: str = Depends(require_admin)):
+    await asyncio.to_thread(admin_service.remove_user, user_id)
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{user_id}/sections/{section_id}/toggle")
+async def admin_toggle_user_section(
+    user_id: int, section_id: int, body: AdminToggleRequest, _: str = Depends(require_admin)
+):
+    await asyncio.to_thread(admin_service.set_user_section, user_id, section_id, body.enabled)
+    return {"ok": True}
+
+
+@app.post("/api/admin/groups")
+async def admin_create_group(body: AdminGroupRequest, user_email: str = Depends(require_admin)):
+    try:
+        await asyncio.to_thread(
+            admin_service.create_group, body.nombre, body.daily_token_limit, body.unlimited, user_email
+        )
+    except admin_service.AdminServiceError as e:
+        _admin_error_response(e)
+    return {"ok": True}
+
+
+@app.post("/api/admin/groups/{group_id}/delete")
+async def admin_delete_group(group_id: int, _: str = Depends(require_admin)):
+    await asyncio.to_thread(admin_service.delete_group, group_id)
+    return {"ok": True}
+
+
+@app.post("/api/admin/groups/{group_id}/limit")
+async def admin_update_group_limit(group_id: int, body: AdminLimitRequest, _: str = Depends(require_admin)):
+    try:
+        await asyncio.to_thread(admin_service.update_group_limit, group_id, body.daily_token_limit, body.unlimited)
+    except admin_service.AdminServiceError as e:
+        _admin_error_response(e)
+    return {"ok": True}
+
+
+@app.post("/api/admin/groups/{group_id}/sections/{section_id}/toggle")
+async def admin_toggle_group_section(
+    group_id: int, section_id: int, body: AdminToggleRequest, _: str = Depends(require_admin)
+):
+    await asyncio.to_thread(admin_service.set_group_section, group_id, section_id, body.enabled)
+    return {"ok": True}
+
+
+@app.post("/api/admin/groups/{group_id}/members")
+async def admin_add_group_members(group_id: int, body: AdminGroupMembersRequest, user_email: str = Depends(require_admin)):
+    try:
+        result = await asyncio.to_thread(admin_service.bulk_add_emails_to_group, group_id, body.emails, user_email)
+    except admin_service.AdminServiceError as e:
+        _admin_error_response(e)
+    return result
+
+
+@app.post("/api/admin/groups/{group_id}/members/{user_id}/remove")
+async def admin_remove_group_member(group_id: int, user_id: int, _: str = Depends(require_admin)):
+    await asyncio.to_thread(admin_service.remove_member_from_group, user_id)
+    return {"ok": True}
 
 
 # ─── Punto de entrada ─────────────────────────────────────────────────────────

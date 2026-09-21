@@ -1,0 +1,95 @@
+{
+  "version": "1.0",
+  "nota": "Especificaciones técnicas mínimas por Gama del Convenio Marco vigente (ID 2239-5-LR25, Anexo A: Requerimientos Técnicos Mínimos, entregado por ChileCompra como adjunto al feedback del piloto). NO confundir con gama_procesador.json: ese archivo clasifica LÍNEAS DE PROCESADOR en 4 niveles de rendimiento (Básica/Media/Alta/Premium) para agrupar equivalentes cross-marca; este archivo transcribe la tabla OFICIAL y CONTRACTUAL de 'Gama 2/3/4' del convenio marco, con pisos mínimos de RAM/procesador/disco/GPU/pantalla y un techo de precio en USD neto por tipo de equipo. El anexo solo define Gama 2, 3 y 4 -- no existe 'Gama 1' oficial para Laptop/Desktop/AIO en este convenio. Solo se transcriben los campos que el asistente efectivamente rastrea en FILLABLE_ATTRIBUTES (ficha_agent.py) -- el anexo real trae más detalle (batería, puertos USB, webcam, candado Kensington, formato del gabinete, etc.) sin atributo equivalente hoy en la ficha, y no se incluye acá. 'Desktop sin pantalla' en el anexo corresponde a tipo_equipo='Desktop' en la ficha (AIO ya es la categoría separada 'con pantalla integrada').",
+  "sinonimos_gama": {
+    "1": 1, "gama 1": 1, "básica": 1, "basica": 1, "entrada": 1, "baja": 1,
+    "2": 2, "gama 2": 2, "media": 2, "intermedia": 2,
+    "3": 3, "gama 3": 3, "alta": 3, "avanzada": 3,
+    "4": 4, "gama 4": 4, "premium": 4, "workstation": 4
+  },
+  "gamas": [
+    {
+      "tipo_equipo": "Laptop", "gama": 2,
+      "linea_procesador": ["Intel Core i5", "AMD Ryzen 5"],
+      "nucleos_min": 6,
+      "total_ram_gb": 16,
+      "total_almacenamiento_gb": 960,
+      "tecnologia_disco_principal": "NVMe SSD",
+      "pantalla_pulgadas": { "min": 14, "max": 16 },
+      "sistema_operativo": "Microsoft Windows 11 Pro",
+      "passmark_min": 16000,
+      "precio_max_usd_neto": 707
+    },
+    {
+      "tipo_equipo": "Laptop", "gama": 3,
+      "linea_procesador": ["Intel Core i7", "AMD Ryzen 7"],
+      "nucleos_min": 8,
+      "total_ram_gb": 32,
+      "total_almacenamiento_gb": 960,
+      "tecnologia_disco_principal": "NVMe SSD",
+      "pantalla_pulgadas": { "min": 14, "max": 16 },
+      "sistema_operativo": "Microsoft Windows 11 Pro",
+      "passmark_min": 22000,
+      "precio_max_usd_neto": 1133
+    },
+    {
+      "tipo_equipo": "Desktop", "gama": 2,
+      "linea_procesador": ["Intel Core i5", "AMD Ryzen 5"],
+      "nucleos_min": 6,
+      "total_ram_gb": 16,
+      "total_almacenamiento_gb": 960,
+      "tecnologia_disco_principal": "NVMe SSD",
+      "sistema_operativo": "Microsoft Windows 11 Pro",
+      "passmark_min": 19000,
+      "precio_max_usd_neto": 738
+    },
+    {
+      "tipo_equipo": "Desktop", "gama": 3,
+      "linea_procesador": ["Intel Core i7", "AMD Ryzen 7"],
+      "nucleos_min": 8,
+      "total_ram_gb": 32,
+      "total_almacenamiento_gb": 960,
+      "tecnologia_disco_principal": "NVMe SSD",
+      "sistema_operativo": "Microsoft Windows 11 Pro",
+      "passmark_min": 25000,
+      "precio_max_usd_neto": 1085
+    },
+    {
+      "tipo_equipo": "Desktop", "gama": 4,
+      "linea_procesador": ["Intel Core Ultra 9", "AMD Ryzen 9"],
+      "nucleos_min": 12,
+      "total_ram_gb": 64,
+      "total_almacenamiento_gb": 960,
+      "tecnologia_disco_principal": "NVMe SSD",
+      "tiene_gpu_dedicada": true,
+      "gpu_vram_min_gb": 16,
+      "sistema_operativo": "Microsoft Windows 11 Pro",
+      "passmark_min": 50000,
+      "precio_max_usd_neto": 3157
+    },
+    {
+      "tipo_equipo": "AIO", "gama": 2,
+      "linea_procesador": ["Intel Core i5", "AMD Ryzen 5"],
+      "nucleos_min": 6,
+      "total_ram_gb": 16,
+      "total_almacenamiento_gb": 960,
+      "tecnologia_disco_principal": "NVMe SSD",
+      "pantalla_pulgadas": { "min": 23 },
+      "sistema_operativo": "Microsoft Windows 11 Pro",
+      "passmark_min": 17000,
+      "precio_max_usd_neto": 934
+    },
+    {
+      "tipo_equipo": "AIO", "gama": 3,
+      "linea_procesador": ["Intel Core i7", "AMD Ryzen 7"],
+      "nucleos_min": 8,
+      "total_ram_gb": 32,
+      "total_almacenamiento_gb": 960,
+      "tecnologia_disco_principal": "NVMe SSD",
+      "pantalla_pulgadas": { "min": 23 },
+      "sistema_operativo": "Microsoft Windows 11 Pro",
+      "passmark_min": 23000,
+      "precio_max_usd_neto": 1138
+    }
+  ]
+}
