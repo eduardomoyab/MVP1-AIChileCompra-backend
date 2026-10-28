@@ -602,21 +602,17 @@ class PriceService:
             logging.warning(f"[get_methodology] Error: {e}")
             return None
 
-    def get_offer_rows(
+    def _offer_rows_where(
         self,
         ficha: Dict[str, Any],
-        limit: int = 30,
         price_min: Optional[int] = None,
         price_max: Optional[int] = None,
         relaxed_attrs: Optional[List[str]] = None,
-    ) -> List[Dict]:
-        """relaxed_attrs: ver docstring de get_methodology() -- mismo
-        mismatch real detectado (estimate() relaja para encontrar 77
-        ofertas, pero esta lista, sin el mismo relajo, filtraba con
-        atributos exactos y devolvía 0 filas)."""
-        table = _resolve_table_name()
-        if not table or not ficha.get("tipo_equipo"):
-            return []
+    ) -> Optional[Tuple[str, dict]]:
+        """WHERE compartido entre get_offer_rows() (la página de filas) y
+        count_offer_rows() (el total para paginar) -- para que page_size/
+        total jamás queden desincronizados por construir el filtro dos veces
+        de forma distinta."""
         current_attrs = {
             col: ficha[col]
             for col in PRICE_QUERY_COLS
@@ -626,14 +622,68 @@ class PriceService:
             current_attrs.pop(attr, None)
         where_clauses, params = _build_where(current_attrs)
         if not where_clauses:
-            return []
+            return None
         if price_min is not None:
             where_clauses.append("precio_unitario::numeric >= :iqr_min")
             params["iqr_min"] = price_min
         if price_max is not None:
             where_clauses.append("precio_unitario::numeric <= :iqr_max")
             params["iqr_max"] = price_max
-        where_sql = " AND ".join(where_clauses)
+        return " AND ".join(where_clauses), params
+
+    def count_offer_rows(
+        self,
+        ficha: Dict[str, Any],
+        price_min: Optional[int] = None,
+        price_max: Optional[int] = None,
+        relaxed_attrs: Optional[List[str]] = None,
+    ) -> int:
+        """Total de transacciones que matchean el filtro actual, para que el
+        paginado de la lista (ver /api/categories/{slug}/offers) sepa cuántas
+        páginas hay en vez de adivinar con el tamaño de la página actual."""
+        table = _resolve_table_name()
+        if not table or not ficha.get("tipo_equipo"):
+            return 0
+        built = self._offer_rows_where(ficha, price_min, price_max, relaxed_attrs)
+        if not built:
+            return 0
+        where_sql, params = built
+        sql = text(f"""
+            SELECT COUNT(*) FROM "{table}"
+            WHERE
+                LOWER(COALESCE(es_accesorio::text,'false')) != 'true'
+                AND precio_unitario::numeric > 200000
+                AND precio_unitario::numeric < 5000000
+                AND {where_sql}
+        """)
+        try:
+            engine = _get_engine()
+            with engine.connect() as conn:
+                return int(conn.execute(sql, params).scalar() or 0)
+        except Exception as e:
+            logging.warning(f"[count_offer_rows] Error: {e}")
+            return 0
+
+    def get_offer_rows(
+        self,
+        ficha: Dict[str, Any],
+        limit: int = 30,
+        price_min: Optional[int] = None,
+        price_max: Optional[int] = None,
+        relaxed_attrs: Optional[List[str]] = None,
+        offset: int = 0,
+    ) -> List[Dict]:
+        """relaxed_attrs: ver docstring de get_methodology() -- mismo
+        mismatch real detectado (estimate() relaja para encontrar 77
+        ofertas, pero esta lista, sin el mismo relajo, filtraba con
+        atributos exactos y devolvía 0 filas)."""
+        table = _resolve_table_name()
+        if not table or not ficha.get("tipo_equipo"):
+            return []
+        built = self._offer_rows_where(ficha, price_min, price_max, relaxed_attrs)
+        if not built:
+            return []
+        where_sql, params = built
         sql = text(f"""
             SELECT
                 codigo_requerimiento,
@@ -674,7 +724,7 @@ class PriceService:
                 AND precio_unitario::numeric < 5000000
                 AND {where_sql}
             ORDER BY fecha_modificacion DESC NULLS LAST
-            LIMIT {limit}
+            LIMIT {limit} OFFSET {offset}
         """)
         try:
             engine = _get_engine()

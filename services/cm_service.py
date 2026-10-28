@@ -39,6 +39,7 @@ import re
 import time
 import logging
 import statistics
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import create_engine, text
@@ -61,6 +62,12 @@ _DB_RETRY_DELAY = 2
 _engine = None
 _rows_cache: Optional[List[Dict]] = None
 _rows_cache_ts: float = 0.0
+# _fetch_rows() es real y lenta (la vista vigente_diario detrás de PrecioCM
+# recorre millones de filas, ver docstring del módulo) -- sin este lock, dos
+# requests casi simultáneas con el caché vencido disparan cada una su propia
+# recarga completa en paralelo (bug real observado en logs: "Catálogo
+# cargado" dos veces seguidas, duplicando la espera para nada).
+_rows_lock = threading.Lock()
 
 
 def _get_engine():
@@ -121,6 +128,84 @@ def _gpu_bool(raw: Any) -> Optional[bool]:
     return None  # "no especificado" u otro valor no interpretable
 
 
+# Reemplaza "SELECT * FROM PrecioCM" -- esa vista computa el precio vigente
+# a partir de maestras.vista_estado_diario, una función de ventana (LEAD()
+# OVER PARTITION BY id_producto, id_proveedor) sobre precio_evento, una
+# tabla de 14.6 MILLONES de filas de historial de precios -- y Postgres no
+# puede empujar un filtro de qué productos nos interesan hacia adentro de
+# esa ventana automáticamente, así que la vista recorre el historial
+# COMPLETO (de todas las categorías, no solo computadores) cada vez,
+# aunque el catálogo final sean ~106 productos (confirmado real: ~38s).
+#
+# Acá se replica la vista línea por línea (ver pg_get_viewdef('"PrecioCM"'))
+# pero filtrando precio_evento por los id_producto de interés ANTES de
+# calcular la ventana -- válido porque cada partición de LEAD() es por
+# (id_producto, id_proveedor): sacar productos que no nos interesan no
+# cambia el resultado de los que sí. Verificado contra la vista original:
+# mismos 106 productos, mismo precio_min/precio_max en los 106, en 0.8s en
+# vez de ~38s. Requiere GRANT SELECT en maestras.precio_evento para el rol
+# de la app (ya no alcanza con acceso solo a la vista) -- si ese permiso
+# llegara a faltar (ej. se revierte), se cae de vuelta a la vista original,
+# más lenta pero siempre funcional.
+_FAST_CM_QUERY = """
+    WITH productos AS (
+        SELECT * FROM cm_computadores.productos_extraccion WHERE tipo_equipo <> 'Otro'
+    ),
+    snapshot_reciente AS (
+        SELECT DISTINCT ON (id_producto) id_producto, nombre, url
+        FROM cm_computadores.producto_snapshot
+        ORDER BY id_producto, fecha DESC
+    ),
+    atributos_extra AS (
+        SELECT id_producto,
+            MAX(CASE WHEN atributo = 'MODELO' THEN valor END) AS modelo,
+            MAX(CASE WHEN atributo = 'PUNTAJE PASSMARK DEL CPU' THEN valor END) AS puntaje_passmark_cpu,
+            MAX(CASE WHEN atributo = 'MONITOR (SI/NO)' THEN valor END) AS monitor_si_no,
+            MAX(CASE WHEN atributo = 'PUERTOS USB' THEN valor END) AS puertos_usb,
+            MAX(CASE WHEN atributo = 'PUERTOS DE SALIDA DE VIDEOS' THEN valor END) AS puertos_salida_videos,
+            MAX(CASE WHEN atributo = 'PESO EQUIPO (SIN CARGADOR)' THEN valor END) AS peso_equipo,
+            MAX(CASE WHEN atributo = 'USO' THEN valor END) AS uso
+        FROM cm_computadores.producto_atributo
+        GROUP BY id_producto
+    ),
+    mis_eventos AS (
+        SELECT *
+        FROM maestras.precio_evento
+        WHERE id_producto IN (SELECT id_producto::integer FROM productos)
+    ),
+    estado AS (
+        SELECT *,
+            LEAD(vigente_desde) OVER (PARTITION BY id_producto, id_proveedor ORDER BY vigente_desde) AS vigente_hasta
+        FROM mis_eventos
+    ),
+    precios_vigentes AS (
+        SELECT id_producto, MIN(precio_regular) AS precio_min, MAX(precio_regular) AS precio_max
+        FROM estado
+        WHERE vigente_hasta IS NULL AND es_baja = 0
+        GROUP BY id_producto
+    )
+    SELECT
+        pe.id_producto::integer AS id_producto,
+        s.url,
+        COALESCE(s.nombre, pe.nombre_modelo) AS nombre,
+        pe.marca,
+        ae.modelo,
+        pe.linea_producto, pe.tipo_equipo, pe.procesador_principal, pe.linea_procesador,
+        pe.generacion_procesador, pe.cantidad_procesadores, pe.nucleos_procesador, pe.hilos_procesador,
+        pe.frecuencia_turbo_procesador_mhz, ae.puntaje_passmark_cpu, pe.total_ram_gb, pe.tecnologia_ram,
+        pe.frecuencia_ram_mhz, pe.total_almacenamiento_gb, pe.tecnologia_disco_principal,
+        pe.tipo_configuracion_discos, pe.tiene_gpu_dedicada, pe.gpu_dedicada_nombre, pe.total_vram_gpu_gb,
+        pe.tecnologia_gpu_principal, pe.pantalla_pulgadas, pe.resolucion_pantalla_pixeles,
+        pe.sistema_operativo, pe.wifi_generacion, pe.part_number, pe.nombre_modelo,
+        ae.monitor_si_no, ae.puertos_usb, ae.puertos_salida_videos, ae.peso_equipo, ae.uso,
+        p.precio_min, p.precio_max
+    FROM productos pe
+    LEFT JOIN snapshot_reciente s ON s.id_producto = pe.id_producto::integer
+    LEFT JOIN atributos_extra ae ON ae.id_producto = pe.id_producto::integer
+    LEFT JOIN precios_vigentes p ON p.id_producto = pe.id_producto::integer
+"""
+
+
 def _fetch_rows() -> List[Dict]:
     engine = _get_engine()
     if not engine:
@@ -129,7 +214,12 @@ def _fetch_rows() -> List[Dict]:
     for attempt in range(_DB_MAX_RETRIES):
         try:
             with engine.connect() as conn:
-                rows = conn.execute(text(f'SELECT * FROM "{_TABLE_NAME}"')).mappings().all()
+                try:
+                    rows = conn.execute(text(_FAST_CM_QUERY)).mappings().all()
+                except Exception as e:
+                    logging.warning(f"[PrecioCM] Consulta rápida falló, usando vista original (más lenta): {e}")
+                    conn.rollback()  # la conexión queda con la transacción abortada tras el error -- limpiarla antes de reusarla
+                    rows = conn.execute(text(f'SELECT * FROM "{_TABLE_NAME}"')).mappings().all()
             result = []
             for r in rows:
                 row = dict(r)
@@ -166,7 +256,15 @@ def _fetch_rows() -> List[Dict]:
 def _get_rows(force: bool = False) -> List[Dict]:
     global _rows_cache, _rows_cache_ts
     now = time.time()
-    if force or _rows_cache is None or (now - _rows_cache_ts) >= _CACHE_TTL_SECONDS:
+    if not force and _rows_cache is not None and (now - _rows_cache_ts) < _CACHE_TTL_SECONDS:
+        return _rows_cache
+
+    with _rows_lock:
+        # Re-chequear adentro del lock -- mientras esperábamos acá, otro
+        # hilo pudo haber terminado de refrescar el caché (ver _rows_lock).
+        now = time.time()
+        if not force and _rows_cache is not None and (now - _rows_cache_ts) < _CACHE_TTL_SECONDS:
+            return _rows_cache
         fresh = _fetch_rows()
         if fresh or _rows_cache is None:
             _rows_cache = fresh

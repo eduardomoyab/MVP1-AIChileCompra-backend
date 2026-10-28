@@ -19,8 +19,18 @@ Endpoints:
   POST /api/medicamentos/describe                  → Descripciones IA por requerimiento (para el PDF del carrito)
   POST /api/medicamentos/reset/{session_id}        → Resetear sesión — Medicamentos
   GET  /health                                     → Estado del servicio
-  GET  /api/schema                                 → Esquema de atributos y valores válidos — Computadores
+  GET  /api/schema                                 → Esquema de atributos y valores válidos — Computadores (legacy)
   GET  /api/medicamentos/schema                    → Esquema de atributos y valores válidos — Medicamentos
+
+  Wizard genérico por categoría (ver plan de implementación -- Fase 1 solo
+  Computadores registrado; "/api/categories/medicamentos/*" da 404 a propósito):
+  GET  /api/categories/{slug}/schema                    → Esquema de atributos de la categoría
+  POST /api/categories/{slug}/analizar/{session_id}     → Análisis de texto libre por LLM (SSE)
+  POST /api/categories/{slug}/manual_update/{session_id}→ Actualización manual de atributo (SSE)
+  GET  /api/categories/{slug}/facets/{session_id}       → Valores válidos de un atributo, acotados por lo ya elegido
+  GET  /api/categories/{slug}/price/{session_id}        → Precio Compra Ágil + Convenio Marco (si la categoría lo soporta)
+  POST /api/categories/{slug}/describe                  → Descripciones IA por ítem del carrito (para el PDF)
+  POST /api/categories/{slug}/reset/{session_id}        → Resetear sesión
 """
 
 import os
@@ -41,6 +51,7 @@ from dotenv import load_dotenv
 from agents.attribute_matcher import AttributeMatcher
 from agents.ficha_agent import FichaAgent, FILLABLE_ATTRIBUTES
 from agents.medicamento_agent import MedicamentoAgent, FILLABLE_ATTRIBUTES_MED, CORE_ATTRS_MED
+from agents.computadores_wizard_agent import ComputadoresWizardAgent
 from services.price_service import PriceService
 from services.cm_service import CMService
 from services import currency_service
@@ -51,7 +62,11 @@ from services import access_service
 from services import admin_service
 from services import usage_service
 from services import chat_session_service
+from services import category_session_service
 from services.medicamento_service import MedicamentoService
+from services import category_service
+import categories.schema as categories_schema
+from categories import computadores_schema  # noqa: F401 -- side-effect: registra el esquema de Computadores
 
 load_dotenv()
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -69,6 +84,7 @@ lgbm_service = LgbmPriceService()
 guardrail = GuardrailService()
 agent: FichaAgent = None
 medicamento_agent: MedicamentoAgent = None
+computadores_wizard_agent: ComputadoresWizardAgent = None
 
 # Historial liviano por sesión para el guardrail (máx 20 mensajes por sesión)
 _session_histories: dict[str, list[dict]] = {}
@@ -77,6 +93,10 @@ _HISTORY_MAX = 20
 # Caché del último estimate por sesión para evitar re-query en /api/offers
 _session_price_cache: dict[str, dict] = {}
 _session_cm_price_cache: dict[str, dict] = {}
+
+# Mismo propósito que _session_price_cache, pero para el wizard genérico de
+# categorías -- ver /api/categories/{slug}/price y /api/categories/{slug}/offers.
+_category_price_cache: dict[str, dict] = {}
 
 # ─── API Key ──────────────────────────────────────────────────────────────────
 
@@ -113,13 +133,15 @@ async def require_admin(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global agent, medicamento_agent
+    global agent, medicamento_agent, computadores_wizard_agent
     agent = FichaAgent(matcher)
     medicamento_agent = MedicamentoAgent(matcher)
+    computadores_wizard_agent = ComputadoresWizardAgent(matcher)
     lgbm_service._load()
     usage_service.ensure_table()
     analytics_service.ensure_table()
     chat_session_service.ensure_table()
+    category_session_service.ensure_table()
     logging.info("Servidor listo — construyendo índices FAISS y dropdowns en background...")
     asyncio.create_task(asyncio.to_thread(matcher.warm))
     asyncio.create_task(asyncio.to_thread(price_service.warmup_dropdowns))
@@ -769,6 +791,21 @@ class DescribeRequest(BaseModel):
     items: list[DescribeItem]
 
 
+class CategoryAnalizarRequest(BaseModel):
+    texto: str
+
+class CategoryManualUpdateRequest(BaseModel):
+    attribute: str
+    value: Optional[Any] = None
+
+class CategoryDescribeItem(BaseModel):
+    texto_original: str
+    atributos: dict
+
+class CategoryDescribeRequest(BaseModel):
+    items: list[CategoryDescribeItem]
+
+
 @app.get("/api/medicamentos/schema")
 async def get_medicamentos_schema():
     schema = {}
@@ -978,6 +1015,386 @@ async def medicamentos_describe_endpoint(
 async def medicamentos_reset_endpoint(session_id: str, _: str = Depends(require_api_key)):
     medicamento_agent.reset_session(session_id)
     return {"type": "reset_ok"}
+
+
+# ─── Wizard genérico por categoría (Fase 1: solo Computadores, ver plan) ──────
+#
+# El slug se valida contra categories.schema -- cualquier categoría no
+# registrada (incluida "medicamentos", que sigue 100% en sus propios
+# endpoints de arriba) da 404 automático, nunca se confunde con el chat
+# legacy de Computadores (/api/chat/*, /api/manual_update/*, /api/cm_offers/*
+# más abajo) ni con /api/medicamentos/*.
+#
+# _get_wizard_agent(slug) hoy solo resuelve a computadores_wizard_agent --
+# es el punto de extensión obvio para cuando se registre un segundo agente
+# de categoría en una fase futura (ver plan, Fase 2: Medicamentos).
+
+def _get_category_schema_or_404(slug: str):
+    schema = categories_schema.get(slug)
+    if not schema:
+        raise HTTPException(status_code=404, detail=f"Categoría '{slug}' no soportada por el wizard")
+    return schema
+
+
+def _get_wizard_agent(slug: str) -> ComputadoresWizardAgent:
+    if slug == "computadores":
+        return computadores_wizard_agent
+    raise HTTPException(status_code=404, detail=f"Categoría '{slug}' no soportada por el wizard")
+
+
+@app.get("/api/categories/{slug}/schema")
+async def get_category_schema(slug: str):
+    schema = _get_category_schema_or_404(slug)
+    attributes = {}
+    for key, meta in schema.attributes.items():
+        entry = meta.to_public_dict()
+        if meta.values_source == "dictionary":
+            entry["valid_values"] = matcher.get_valid_values(schema.categoria_db, key)
+        attributes[key] = entry
+    return {
+        "slug": schema.slug,
+        "label": schema.label,
+        "supports_convenio_marco": schema.supports_convenio_marco,
+        "core_order": schema.core_order,
+        "attributes": attributes,
+    }
+
+
+@app.post("/api/categories/{slug}/analizar/{session_id}")
+async def category_analizar_endpoint(
+    slug: str,
+    session_id: str,
+    body: CategoryAnalizarRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    schema = _get_category_schema_or_404(slug)
+    wiz_agent = _get_wizard_agent(slug)
+    texto = body.texto.strip()
+    if not texto:
+        async def empty():
+            yield sse({"type": "error", "message": "Texto vacío"})
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(empty(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    async def event_gen():
+        t0 = time.perf_counter()
+        try:
+            if await asyncio.to_thread(usage_service.is_blocked, user_email):
+                usage_info = await asyncio.to_thread(usage_service.get_usage, user_email)
+                yield sse({"type": "usage_limit_reached", "data": usage_service.to_public(usage_info)})
+                yield "data: [DONE]\n\n"
+                analytics_service.log(
+                    session_id=session_id, user_email=user_email, tipo=f"category_{slug}_usage_blocked",
+                    user_msg=texto, duration_ms=int((time.perf_counter() - t0) * 1000),
+                    blocked=True, block_reason="límite diario de tokens alcanzado",
+                )
+                return
+
+            result = await wiz_agent.analyze(session_id, texto)
+
+            if result.get("ficha_updates"):
+                yield sse({"type": "ficha_update", "updates": result["ficha_updates"]})
+            if result.get("complement_updates"):
+                yield sse({"type": "ficha_update", "updates": result["complement_updates"]})
+            if result.get("message"):
+                yield sse({"type": "message", "text": result["message"]})
+            if result.get("questions"):
+                yield sse({"type": "questions", "questions": result["questions"]})
+
+            price_found = False
+            ficha = wiz_agent.get_ficha(session_id)
+            # Pendiente real reportado: sin esto, el formulario se perdía al
+            # refrescar/cerrar la pestaña -- ver category_session_service.py.
+            # texto_original solo se guarda acá (único punto donde existe).
+            # title_hint: título corto que la IA ya armó en la misma pasada
+            # de extracción (ver "titulo" en ComputadoresWizardAgent.analyze)
+            # -- como ChatGPT nombrando la conversación, no el texto crudo.
+            await asyncio.to_thread(
+                category_session_service.save_ficha,
+                session_id, slug, user_email, ficha, texto, result.get("titulo"),
+            )
+            for core_attr in schema.core_attributes():
+                if ficha.get(core_attr.key) is None:
+                    break
+            else:
+                try:
+                    price_data, cm_price_data = await asyncio.to_thread(
+                        category_service.estimate_price, schema, ficha, price_service, cm_service
+                    )
+                    if price_data:
+                        price_found = True
+                        yield sse({"type": "price_update", "data": price_data})
+                    else:
+                        yield sse({"type": "price_not_found"})
+                    if schema.supports_convenio_marco:
+                        if cm_price_data:
+                            yield sse({"type": "cm_price_update", "data": cm_price_data})
+                        else:
+                            yield sse({"type": "cm_price_not_found"})
+                except Exception as e:
+                    logging.warning(f"Error en estimación de precio (categories/{slug}): {e}")
+                    yield sse({"type": "price_not_found"})
+
+            yield "data: [DONE]\n\n"
+
+            usage = result.get("tokens")
+            ficha_updates = result.get("ficha_updates", [])
+            analytics_service.log(
+                session_id=session_id,
+                user_email=user_email,
+                tipo=f"category_{slug}_analizar",
+                user_msg=texto,
+                ai_msg=result.get("message", ""),
+                tokens_in=usage.prompt_tokens if usage else None,
+                tokens_out=usage.completion_tokens if usage else None,
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                n_updates=len(ficha_updates),
+                price_found=price_found,
+                model=wiz_agent.model,
+                attrs_updated=",".join(u["attribute"] for u in ficha_updates) or None,
+            )
+            tokens_total = usage.total_tokens if usage else 0
+            await asyncio.to_thread(usage_service.add_usage, user_email, tokens_total)
+
+        except Exception as e:
+            logging.error(f"Error en categories/{slug} analizar SSE {session_id}: {e}", exc_info=True)
+            yield sse({"type": "error", "message": "Error interno del servidor"})
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+@app.post("/api/categories/{slug}/manual_update/{session_id}")
+async def category_manual_update_endpoint(
+    slug: str,
+    session_id: str,
+    body: CategoryManualUpdateRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    schema = _get_category_schema_or_404(slug)
+    wiz_agent = _get_wizard_agent(slug)
+    if not body.attribute:
+        async def err():
+            yield sse({"type": "error", "message": "Atributo requerido"})
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(err(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    async def event_gen():
+        t0 = time.perf_counter()
+        try:
+            result = wiz_agent.apply_manual_update(session_id, body.attribute, body.value)
+
+            if result["updates"]:
+                yield sse({"type": "ficha_update", "updates": result["updates"]})
+            if result.get("complement_updates"):
+                yield sse({"type": "ficha_update", "updates": result["complement_updates"]})
+
+            price_found = False
+            ficha = wiz_agent.get_ficha(session_id)
+            # texto_original=None -- no lo pisa, solo /analizar lo setea (ver
+            # category_session_service.save_ficha).
+            await asyncio.to_thread(category_session_service.save_ficha, session_id, slug, user_email, ficha)
+            for core_attr in schema.core_attributes():
+                if ficha.get(core_attr.key) is None:
+                    break
+            else:
+                try:
+                    price_data, cm_price_data = await asyncio.to_thread(
+                        category_service.estimate_price, schema, ficha, price_service, cm_service
+                    )
+                    if price_data:
+                        price_found = True
+                        yield sse({"type": "price_update", "data": price_data})
+                    else:
+                        yield sse({"type": "price_not_found"})
+                    if schema.supports_convenio_marco:
+                        if cm_price_data:
+                            yield sse({"type": "cm_price_update", "data": cm_price_data})
+                        else:
+                            yield sse({"type": "cm_price_not_found"})
+                except Exception as e:
+                    logging.warning(f"Error en estimación de precio (categories/{slug}): {e}")
+                    yield sse({"type": "price_not_found"})
+
+            yield "data: [DONE]\n\n"
+
+            analytics_service.log(
+                session_id=session_id,
+                user_email=user_email,
+                tipo=f"category_{slug}_manual_update",
+                user_msg=f"{body.attribute}={body.value}",
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                n_updates=len(result.get("updates", [])),
+                price_found=price_found,
+                attrs_updated=body.attribute,
+            )
+
+        except Exception as e:
+            logging.error(f"Error en categories/{slug} manual_update SSE {session_id}: {e}", exc_info=True)
+            yield sse({"type": "error", "message": "Error interno"})
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+@app.get("/api/categories/{slug}/facets/{session_id}")
+async def get_category_facets(
+    slug: str,
+    session_id: str,
+    attr: str,
+    _: str = Depends(require_api_key),
+):
+    schema = _get_category_schema_or_404(slug)
+    wiz_agent = _get_wizard_agent(slug)
+    ficha = wiz_agent.get_ficha(session_id)
+    values = await asyncio.to_thread(category_service.get_facet_values, schema, attr, ficha, matcher, price_service)
+    return {"attribute": attr, "values": values}
+
+
+@app.get("/api/categories/{slug}/price/{session_id}")
+async def get_category_price(
+    slug: str,
+    session_id: str,
+    _: str = Depends(require_api_key),
+):
+    schema = _get_category_schema_or_404(slug)
+    wiz_agent = _get_wizard_agent(slug)
+    ficha = wiz_agent.get_ficha(session_id)
+    price_data, cm_price_data = await asyncio.to_thread(
+        category_service.estimate_price, schema, ficha, price_service, cm_service
+    )
+    # Mismo criterio que _session_price_cache del chat legacy -- /offers
+    # necesita el mismo relajo que usó estimate() para no filtrar con la
+    # ficha completa sin relajar y devolver 0 filas (ver docstring de
+    # category_service.get_offer_rows).
+    if price_data:
+        _category_price_cache[session_id] = {"relaxed_attrs": price_data.get("relaxed_attrs")}
+    return {"price_data": price_data, "cm_price_data": cm_price_data}
+
+
+@app.get("/api/categories/{slug}/offers/{session_id}")
+async def get_category_offers(
+    slug: str,
+    session_id: str,
+    price_min: Optional[int] = None,
+    price_max: Optional[int] = None,
+    page: int = 1,
+    page_size: int = 10,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    """Transacciones individuales de Compra Ágil detrás de la estimación
+    (panel de precio del wizard solo muestra el agregado). Paginado real
+    (page/page_size), no un tope fijo -- antes esto traía siempre un máximo
+    de 30 filas sin forma de ver el resto; con categorías de specs comunes
+    el total real puede ser miles de transacciones. Convenio Marco no
+    necesita un endpoint equivalente -- CMService.estimate() ya trae las
+    filas de producto en su propio resultado (cm_price_data.products)."""
+    _get_category_schema_or_404(slug)
+    wiz_agent = _get_wizard_agent(slug)
+    ficha = wiz_agent.get_ficha(session_id)
+    if not ficha.get("tipo_equipo"):
+        return {"offers": [], "total": 0, "page": 1, "page_size": page_size}
+
+    page = max(1, page)
+    page_size = max(1, min(page_size, 50))
+    relaxed_attrs = _category_price_cache.get(session_id, {}).get("relaxed_attrs")
+    rows, total = await asyncio.gather(
+        asyncio.to_thread(
+            category_service.get_offer_rows, ficha, price_service, page_size, price_min, price_max,
+            relaxed_attrs, (page - 1) * page_size,
+        ),
+        asyncio.to_thread(
+            category_service.count_offer_rows, ficha, price_service, price_min, price_max, relaxed_attrs
+        ),
+    )
+    analytics_service.log(session_id=session_id, user_email=user_email, tipo=f"category_{slug}_ver_historial")
+    return {"offers": _enrich_offers(rows), "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/api/categories/{slug}/describe")
+async def category_describe_endpoint(
+    slug: str,
+    body: CategoryDescribeRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    _get_category_schema_or_404(slug)
+    wiz_agent = _get_wizard_agent(slug)
+    items = [item.dict() for item in body.items]
+    if not items:
+        return {"descripciones": []}
+    descripciones = await wiz_agent.describe_batch(items)
+    analytics_service.log(
+        session_id="", user_email=user_email, tipo=f"category_{slug}_pdf_describe", n_updates=len(items),
+    )
+    return {"descripciones": descripciones}
+
+
+@app.post("/api/categories/{slug}/reset/{session_id}")
+async def category_reset_endpoint(slug: str, session_id: str, _: str = Depends(require_api_key)):
+    _get_category_schema_or_404(slug)
+    wiz_agent = _get_wizard_agent(slug)
+    wiz_agent.reset_session(session_id)
+    return {"type": "reset_ok"}
+
+
+# ─── Historial de formularios (ver category_session_service.py) ───────────────
+# Pendiente real reportado: el wizard no tenía ningún mecanismo para volver
+# a ver/retomar un formulario ya empezado, a diferencia del chat legacy
+# (/api/sessions más arriba). El guardado incremental vive en los propios
+# endpoints de analizar/manual_update (ver save_ficha ahí); acá solo se
+# lista, retoma, renombra y borra.
+
+@app.get("/api/categories/{slug}/sessions")
+async def list_category_sessions_endpoint(
+    slug: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+):
+    _get_category_schema_or_404(slug)
+    sessions = await asyncio.to_thread(category_session_service.list_sessions, slug, user_email)
+    return {"sessions": sessions}
+
+
+@app.post("/api/categories/{slug}/sessions/{session_id}/resume")
+async def resume_category_session_endpoint(
+    slug: str, session_id: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+):
+    _get_category_schema_or_404(slug)
+    wiz_agent = _get_wizard_agent(slug)
+    saved = await asyncio.to_thread(category_session_service.get_full_session, session_id, slug, user_email)
+    if not saved:
+        raise HTTPException(status_code=404, detail="Formulario no encontrado")
+    # Re-sembrar en memoria -- este proceso puede no tener nunca visto este
+    # session_id (otra pestaña, otro día, o el backend se reinició entre
+    # medio), y get_ficha()/estimate_price() leen del estado en memoria.
+    wiz_agent.seed_session(session_id, saved["ficha"], saved["texto_original"])
+    return {"title": saved["title"], "ficha": saved["ficha"], "texto_original": saved["texto_original"]}
+
+
+@app.post("/api/categories/{slug}/sessions/{session_id}/rename")
+async def rename_category_session_endpoint(
+    slug: str,
+    session_id: str,
+    body: RenameSessionRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    ok = await asyncio.to_thread(category_session_service.rename, session_id, slug, user_email, body.title)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Formulario no encontrado")
+    return {"ok": True}
+
+
+@app.post("/api/categories/{slug}/sessions/{session_id}/delete")
+async def delete_category_session_endpoint(
+    slug: str, session_id: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+):
+    ok = await asyncio.to_thread(category_session_service.delete, session_id, slug, user_email)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Formulario no encontrado")
+    return {"ok": True}
 
 
 # ─── Administración (grupos, usuarios, tokens, módulos) ───────────────────────
