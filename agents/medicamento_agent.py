@@ -33,6 +33,8 @@ entre valores reales observados (facetas) en vez de un match aproximado.
 
 import os
 import json
+import asyncio
+import contextlib
 import logging
 from typing import Any, Dict, List, Tuple
 
@@ -207,13 +209,31 @@ class MedicamentoAgent:
             {"role": "user", "content": texto},
         ]
 
+        extraction = asyncio.ensure_future(self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            response_format={"type": "json_object"},
+        ))
+        gate_usage = None
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                response_format={"type": "json_object"},
-            )
+            es_medicamento, gate_usage = await self._looks_like_medicamento(texto)
+        except Exception as e:
+            logging.warning(f"[MedicamentoAgent] descarte rápido falló, se sigue con la extracción: {e}")
+            es_medicamento = True
+        if not es_medicamento:
+            extraction.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await extraction
+            return {
+                "message": "Eso no parece un medicamento o insumo farmacéutico.",
+                "ficha_updates": [],
+                "questions": ["¿Qué medicamento necesitas? Elige el principio activo de la lista o escríbelo."],
+                "tokens": gate_usage,
+            }
+
+        try:
+            response = await extraction
         except Exception as e:
             logging.error(f"Error OpenAI (medicamentos): {e}")
             return {
@@ -258,18 +278,46 @@ class MedicamentoAgent:
             "tokens": usage,
         }
 
+    async def _looks_like_medicamento(self, texto: str) -> tuple:
+        """(¿habla de un medicamento?, usage). Solo dice que NO ante algo
+        claramente ajeno; con cualquier duda responde que sí y deja que la
+        extracción completa decida (hay marcas comerciales y nombres locales
+        que el modelo puede no conocer)."""
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            temperature=0,
+            max_tokens=3,
+            messages=[
+                {"role": "system", "content": (
+                    "Clasificas textos de compras públicas. Responde SOLO 'SI' o 'NO'. "
+                    "SI: el texto menciona o describe un medicamento o insumo farmacéutico (fármaco, principio activo, "
+                    "nombre comercial de un remedio, forma farmacéutica, dosis o concentración), o pide un medicamento "
+                    "de forma genérica. NO: trata claramente de otra cosa (computadores, muebles, alimentos, vehículos, "
+                    "ropa, servicios, útiles de oficina, etc.). Ante la duda, responde SI."
+                )},
+                {"role": "user", "content": texto[:1500]},
+            ],
+        )
+        answer = (response.choices[0].message.content or "").strip().upper()
+        return (not answer.startswith("NO")), response.usage
+
     async def describe_batch(self, items: List[Dict[str, Any]]) -> List[str]:
-        """Genera un párrafo de Compra Ágil por requerimiento (NO de
-        licitación -- es un mecanismo distinto), en UNA sola llamada (no
-        una por ítem) -- se usa al descargar el PDF del carrito de
-        requerimientos, nunca al agregar un ítem (evita gastar LLM en cada
-        agregado al carrito).
+        """Solo las descripciones (ver describe_and_name_batch)."""
+        descripciones, _ = await self.describe_and_name_batch(items)
+        return descripciones
+
+    async def describe_and_name_batch(self, items: List[Dict[str, Any]]) -> tuple:
+        """(descripciones, nombres): un párrafo de Compra Ágil (NO de licitación,
+        que es un mecanismo distinto) y un nombre corto del producto por
+        requerimiento, en UNA sola llamada (no una por ítem). El nombre es el
+        título del ítem en el PDF técnico: describe el producto, no para qué
+        se compra. Se usa al descargar el PDF o al agregar un ítem al carrito.
 
         items: [{"texto_original": str, "atributos": {attr: valor}}]
-        Devuelve una lista de párrafos, mismo orden y misma cantidad que items.
+        Devuelve dos listas, mismo orden y misma cantidad que items.
         """
         if not items:
-            return []
+            return [], []
 
         lineas = []
         for i, item in enumerate(items):
@@ -287,10 +335,16 @@ class MedicamentoAgent:
 
 Describe cada requerimiento por principio activo, forma farmacéutica y concentración según corresponda -- **nunca menciones una marca comercial** (la compra pública no puede restringir a una marca específica salvo justificación técnica). Si falta algún dato, redacta de forma genérica sin inventar información que no esté en los atributos entregados.
 
+Además, para CADA requerimiento entrega un **nombre corto del producto** (máximo 60 caracteres), que se usará como título del ítem en el documento:
+- Principio activo, forma farmacéutica y concentración (por ejemplo "Levotiroxina 100 mcg comprimidos", "Amoxicilina 500 mg cápsulas").
+- Describe el PRODUCTO, nunca el destino ni para qué se necesita (áreas, personas, instituciones, pacientes), aunque aparezca en el texto del usuario.
+- Sin marca comercial, sin cantidades, sin punto final.
+- Usa SOLO datos presentes en los atributos entregados; no inventes dosis ni formas que no estén.
+
 Requerimientos:
 {items_block}
 
-Responde en JSON con esta forma exacta: {{"descripciones": ["párrafo del requerimiento 0", "párrafo del requerimiento 1", ...]}} -- en el mismo orden y la misma cantidad ({len(items)}) que los requerimientos listados arriba."""
+Responde en JSON con esta forma exacta: {{"descripciones": ["párrafo del requerimiento 0", ...], "nombres": ["nombre corto del requerimiento 0", ...]}} -- ambas listas en el mismo orden y con la misma cantidad ({len(items)}) que los requerimientos listados arriba."""
 
         try:
             response = await self.client.chat.completions.create(
@@ -301,14 +355,18 @@ Responde en JSON con esta forma exacta: {{"descripciones": ["párrafo del requer
             )
             parsed = json.loads(response.choices[0].message.content)
             descripciones = parsed.get("descripciones", []) or []
+            nombres = parsed.get("nombres", []) or []
         except Exception as e:
             logging.error(f"Error generando descripciones de PDF: {e}")
-            descripciones = []
+            descripciones, nombres = [], []
 
-        # Asegura el mismo largo que items aunque el LLM devuelva de menos.
+        # Asegura el mismo largo que items aunque el LLM devuelva de menos, y un tope de largo en el nombre.
+        nombres = [(str(n).strip().rstrip(".")[:60]).rstrip() for n in nombres]
         while len(descripciones) < len(items):
             descripciones.append("")
-        return descripciones[:len(items)]
+        while len(nombres) < len(items):
+            nombres.append("")
+        return descripciones[:len(items)], nombres[:len(items)]
 
     def apply_manual_update(self, session_id: str, attribute: str, value: Any) -> Dict[str, Any]:
         """Actualización manual (sin LLM) -- mismo contrato de salida que analyze()."""

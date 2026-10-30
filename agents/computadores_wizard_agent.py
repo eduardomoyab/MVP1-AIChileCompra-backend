@@ -26,6 +26,8 @@ derivación de linea_procesador a partir de un modelo exacto
 
 import os
 import json
+import asyncio
+import contextlib
 import logging
 from typing import Any, Dict, List, Tuple
 
@@ -141,13 +143,37 @@ class ComputadoresWizardAgent:
             {"role": "user", "content": texto},
         ]
 
+        # Descarte rápido de lo que no es un computador: una consulta mínima
+        # (responde SI/NO, pocos tokens) corre EN PARALELO con la extracción
+        # completa. Si dice NO, se cancela la extracción y se corta ahí --
+        # antes se hacía todo (extracción larga, normalización, guardado) y
+        # recién al final se descubría que no era un computador. Con un
+        # computador no agrega espera: ambas corren a la vez.
+        extraction = asyncio.ensure_future(self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            response_format={"type": "json_object"},
+        ))
+        gate_usage = None
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                response_format={"type": "json_object"},
-            )
+            es_computador, gate_usage = await self._looks_like_computer(texto)
+        except Exception as e:
+            logging.warning(f"[ComputadoresWizardAgent] descarte rápido falló, se sigue con la extracción: {e}")
+            es_computador = True
+        if not es_computador:
+            extraction.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await extraction
+            session["ficha"]["tipo_equipo"] = "Otro"
+            return {
+                "message": "", "titulo": "", "off_topic": True,
+                "ficha_updates": [{"attribute": "tipo_equipo", "value": "Otro", "source": "ai", "normalized": True, "score": 1.0}],
+                "complement_updates": [], "questions": [], "tokens": gate_usage,
+            }
+
+        try:
+            response = await extraction
         except Exception as e:
             logging.error(f"Error OpenAI (wizard computadores): {e}")
             return {
@@ -206,17 +232,46 @@ class ComputadoresWizardAgent:
             "tokens": usage,
         }
 
+    async def _looks_like_computer(self, texto: str) -> tuple:
+        """(¿habla de un computador?, usage). Solo dice que NO ante algo
+        claramente ajeno; con cualquier duda responde que sí y deja que la
+        extracción completa decida."""
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            temperature=0,
+            max_tokens=3,
+            messages=[
+                {"role": "system", "content": (
+                    "Clasificas textos de compras públicas. Responde SOLO 'SI' o 'NO'. "
+                    "SI: el texto menciona o describe un computador (notebook, laptop, equipo todo en uno / AIO, "
+                    "PC o computador de escritorio, torre), con o sin especificaciones, o es una petición genérica "
+                    "de un computador. NO: trata claramente de otra cosa (impresoras, muebles, alimentos, vehículos, "
+                    "ropa, servicios, medicamentos, etc.). Ante la duda, responde SI."
+                )},
+                {"role": "user", "content": texto[:1500]},
+            ],
+        )
+        answer = (response.choices[0].message.content or "").strip().upper()
+        return (not answer.startswith("NO")), response.usage
+
     async def describe_batch(self, items: List[Dict[str, Any]]) -> List[str]:
-        """Genera un párrafo de Compra Ágil por requerimiento del carrito, en
-        UNA sola llamada (no una por ítem) -- se usa al descargar el PDF,
-        nunca al agregar un ítem al carrito. Mismo patrón que
-        MedicamentoAgent.describe_batch.
+        """Solo las descripciones (ver describe_and_name_batch)."""
+        descripciones, _ = await self.describe_and_name_batch(items)
+        return descripciones
+
+    async def describe_and_name_batch(self, items: List[Dict[str, Any]]) -> tuple:
+        """Genera, por requerimiento del carrito y en UNA sola llamada (no una
+        por ítem): un párrafo de Compra Ágil y un nombre corto del producto.
+        Se usa al descargar el PDF, nunca al agregar un ítem al carrito.
+        Mismo patrón que MedicamentoAgent.describe_batch.
 
         items: [{"texto_original": str, "atributos": {attr: valor}}]
-        Devuelve una lista de párrafos, mismo orden y misma cantidad que items.
+        Devuelve (descripciones, nombres): dos listas, mismo orden y misma
+        cantidad que items. El nombre es el título del ítem en el PDF -- describe
+        el producto, no para qué se compra (el PDF va a los proveedores).
         """
         if not items:
-            return []
+            return [], []
 
         lineas = []
         for i, item in enumerate(items):
@@ -247,10 +302,16 @@ class ComputadoresWizardAgent:
 
 Ejemplo del tono esperado (no copiar el contenido, solo el estilo): "Se requiere un computador tipo AIO, con procesador de línea Intel Core i5 o AMD Ryzen 5, 16 GB de RAM y 1000 GB de almacenamiento."
 
+Además, para CADA requerimiento entrega un **nombre corto del producto** (máximo 60 caracteres), que se usará como título del ítem en el documento:
+- Nombra el producto con su tipo y sus características técnicas principales (por ejemplo "Notebook Core i5, 16 GB y SSD 512 GB", "Computador All in One Core i5, 8 GB").
+- Describe el PRODUCTO, nunca el uso ni el destino: no menciones áreas, personas, cargos, instituciones ni para qué se necesita ("para el área legal", "para atención de público", etc.), aunque aparezcan en el texto original del usuario.
+- Sin marca (salvo que el usuario la haya pedido), sin cantidades, sin calificativos de venta, sin punto final.
+- Usa SOLO datos presentes en los atributos entregados: no agregues tecnologías ni especificaciones que no estén (por ejemplo, no escribas "SSD" si no hay un atributo de tecnología de disco; di solo "512 GB").
+
 Requerimientos:
 {items_block}
 
-Responde en JSON con esta forma exacta: {{"descripciones": ["descripción del requerimiento 0", "descripción del requerimiento 1", ...]}} -- en el mismo orden y la misma cantidad ({len(items)}) que los requerimientos listados arriba."""
+Responde en JSON con esta forma exacta: {{"descripciones": ["descripción del requerimiento 0", "descripción del requerimiento 1", ...], "nombres": ["nombre corto del requerimiento 0", "nombre corto del requerimiento 1", ...]}} -- ambas listas en el mismo orden y con la misma cantidad ({len(items)}) que los requerimientos listados arriba."""
 
         try:
             response = await self.client.chat.completions.create(
@@ -261,13 +322,18 @@ Responde en JSON con esta forma exacta: {{"descripciones": ["descripción del re
             )
             parsed = json.loads(response.choices[0].message.content)
             descripciones = parsed.get("descripciones", []) or []
+            nombres = parsed.get("nombres", []) or []
         except Exception as e:
             logging.error(f"Error generando descripciones de PDF (wizard computadores): {e}")
-            descripciones = []
+            descripciones, nombres = [], []
 
+        # Tope de largo del nombre: el modelo a veces se pasa del límite pedido
+        nombres = [(str(n).strip().rstrip(".")[:60]).rstrip() for n in nombres]
         while len(descripciones) < len(items):
             descripciones.append("")
-        return descripciones[:len(items)]
+        while len(nombres) < len(items):
+            nombres.append("")
+        return descripciones[:len(items)], nombres[:len(items)]
 
     def apply_manual_update(self, session_id: str, attribute: str, value: Any) -> Dict[str, Any]:
         """Actualización manual (sin LLM) -- un control del wizard (chip,

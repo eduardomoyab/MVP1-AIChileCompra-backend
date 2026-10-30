@@ -40,12 +40,13 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
+from urllib.parse import quote
 
 from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
 from agents.attribute_matcher import AttributeMatcher
@@ -65,6 +66,8 @@ from services import chat_session_service
 from services import category_session_service
 from services.medicamento_service import MedicamentoService
 from services import category_service
+from services import pdf_service
+from services import market_service
 import categories.schema as categories_schema
 from categories import computadores_schema  # noqa: F401 -- side-effect: registra el esquema de Computadores
 
@@ -180,12 +183,38 @@ def sse(data: dict) -> str:
 
 # ─── Modelos ──────────────────────────────────────────────────────────────────
 
+# ─── Límites de entrada ──────────────────────────────────────────────────────
+# Todo lo que llega del cliente se acota: largo de textos, cantidad de ítems y
+# tamaño de los valores libres (un valor enorme dispararía normalización por
+# embeddings y consultas para nada). El frontend ya respeta estos topes; acá
+# se exigen del lado servidor.
+MAX_TEXTO = 1000          # texto libre de un requerimiento
+MAX_VALOR_JSON = 2000     # tamaño (en caracteres JSON) de un valor de atributo
+
+
+def _valor_acotado(v):
+    if v is None:
+        return v
+    try:
+        size = len(json.dumps(v, default=str))
+    except Exception:
+        raise ValueError("valor inválido")
+    if size > MAX_VALOR_JSON:
+        raise ValueError("valor demasiado largo")
+    return v
+
+
 class ChatRequest(BaseModel):
-    content: str
+    content: str = Field(max_length=4000)
 
 class ManualUpdateRequest(BaseModel):
-    attribute: str
+    attribute: str = Field(max_length=64)
     value: Optional[Any] = None
+
+    @field_validator("value")
+    @classmethod
+    def _check_value(cls, v):
+        return _valor_acotado(v)
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
@@ -252,7 +281,7 @@ async def save_compare_endpoint(
 # mismo a partir de la ficha, igual que tras cada turno de chat.
 
 class RenameSessionRequest(BaseModel):
-    title: str
+    title: str = Field(max_length=200)
 
 
 def _recompute_prices(session_id: str, ficha: dict) -> tuple[Optional[dict], Optional[dict]]:
@@ -746,7 +775,7 @@ async def get_cm_offers_endpoint(
 # ─── Track evento frontend ────────────────────────────────────────────────────
 
 class TrackRequest(BaseModel):
-    tipo: str
+    tipo: str = Field(max_length=100)
 
 @app.post("/api/track/{session_id}")
 async def track_endpoint(
@@ -777,33 +806,69 @@ def _enrich_medicamentos(rows: list) -> list:
 
 
 class MedicamentoAnalizarRequest(BaseModel):
-    texto: str
+    texto: str = Field(max_length=MAX_TEXTO)
 
 class MedicamentoManualUpdateRequest(BaseModel):
-    attribute: str
+    attribute: str = Field(max_length=64)
     value: Optional[Any] = None
 
+    @field_validator("value")
+    @classmethod
+    def _check_value(cls, v):
+        return _valor_acotado(v)
+
 class DescribeItem(BaseModel):
-    texto_original: str
+    texto_original: str = Field(max_length=MAX_TEXTO)
     atributos: dict
 
 class DescribeRequest(BaseModel):
-    items: list[DescribeItem]
+    items: list[DescribeItem] = Field(max_length=50)
 
 
 class CategoryAnalizarRequest(BaseModel):
-    texto: str
+    texto: str = Field(max_length=MAX_TEXTO)
 
 class CategoryManualUpdateRequest(BaseModel):
-    attribute: str
+    attribute: str = Field(max_length=64)
     value: Optional[Any] = None
 
+    @field_validator("value")
+    @classmethod
+    def _check_value(cls, v):
+        return _valor_acotado(v)
+
 class CategoryDescribeItem(BaseModel):
-    texto_original: str
+    texto_original: str = Field(max_length=MAX_TEXTO)
     atributos: dict
 
 class CategoryDescribeRequest(BaseModel):
-    items: list[CategoryDescribeItem]
+    items: list[CategoryDescribeItem] = Field(max_length=50)
+
+class CategorySaveCartRequest(BaseModel):
+    cart: list[dict] = Field(max_length=50)
+
+class CategoryPdfItem(BaseModel):
+    nombre: Optional[str] = Field(default=None, max_length=200)
+    texto_original: Optional[str] = Field(default=None, max_length=1000)
+    atributos: dict
+    descripcion: Optional[str] = Field(default=None, max_length=3000)
+    cantidad: Optional[int] = Field(default=None, ge=1, le=10_000_000)
+
+class CategoryPdfRequest(BaseModel):
+    items: list[CategoryPdfItem] = Field(max_length=50)
+    session_id: str = Field(default="", max_length=64)
+
+# Resumen ejecutivo: datos de mercado por ítem. Límites explícitos porque
+# cada ítem dispara consultas a la base de transacciones.
+MARKET_MAX_ITEMS = 12
+
+class CategoryMarketItem(BaseModel):
+    id: str = Field(max_length=64)
+    atributos: dict
+    relaxed_attrs: list[str] = Field(default_factory=list, max_length=20)
+
+class CategoryMarketRequest(BaseModel):
+    items: list[CategoryMarketItem] = Field(max_length=MARKET_MAX_ITEMS)
 
 
 @app.get("/api/medicamentos/schema")
@@ -1003,12 +1068,66 @@ async def medicamentos_describe_endpoint(
 ):
     items = [item.dict() for item in body.items]
     if not items:
-        return {"descripciones": []}
-    descripciones = await medicamento_agent.describe_batch(items)
+        return {"descripciones": [], "nombres": []}
+    descripciones, nombres = await medicamento_agent.describe_and_name_batch(items)
     analytics_service.log(
         session_id="", user_email=user_email, tipo="medicamento_pdf_describe", n_updates=len(items),
     )
-    return {"descripciones": descripciones}
+    return {"descripciones": descripciones, "nombres": nombres}
+
+
+@app.post("/api/medicamentos/pdf")
+async def medicamentos_pdf_endpoint(
+    body: CategoryPdfRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    """PDF técnico del requerimiento de Medicamentos (solo especificaciones y
+    cantidades; los precios van en el resumen ejecutivo). Mismo generador y
+    mismas validaciones que /api/categories/{slug}/pdf."""
+    schema = pdf_service.MEDICAMENTOS_SCHEMA
+    items = [item.dict() for item in body.items]
+    if not items:
+        raise HTTPException(status_code=400, detail="El requerimiento no tiene compras")
+    for it in items:
+        it["atributos"] = market_service.sanitize_ficha(schema, it["atributos"])
+    pdf_bytes = await asyncio.to_thread(pdf_service.build_requirements_pdf, schema, items, body.session_id)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="especificaciones-tecnicas-medicamentos.pdf"'},
+    )
+
+
+@app.post("/api/medicamentos/market")
+async def medicamentos_market_endpoint(
+    body: CategoryMarketRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    """Datos de mercado por ítem de Medicamentos para el resumen ejecutivo
+    (misma forma de respuesta y mismas validaciones que
+    /api/categories/{slug}/market; aquí "proveedor" = laboratorio)."""
+    schema = pdf_service.MEDICAMENTOS_SCHEMA
+    if not body.items:
+        raise HTTPException(status_code=400, detail="Sin ítems")
+    gate = asyncio.Semaphore(3)
+
+    async def one(item: CategoryMarketItem) -> dict:
+        ficha = market_service.sanitize_ficha(schema, item.atributos)
+        async with gate:
+            data = await asyncio.to_thread(market_service.analyze_medicamentos, ficha, medicamento_service)
+        serie = [
+            {**pt, "u": f"{_CA_BUSCADOR_BASE}?code={quote(pt['c'], safe='')}" if pt.get("c") else None}
+            for pt in data.get("serie", [])
+        ]
+        return {"id": item.id, **data, "serie": serie}
+
+    results = await asyncio.gather(*(one(i) for i in body.items))
+    analytics_service.log(
+        session_id="", user_email=user_email, tipo="medicamento_resumen_mercado", n_updates=len(body.items),
+    )
+    return {"items": results}
 
 
 @app.post("/api/medicamentos/reset/{session_id}")
@@ -1095,6 +1214,22 @@ async def category_analizar_endpoint(
 
             if result.get("ficha_updates"):
                 yield sse({"type": "ficha_update", "updates": result["ficha_updates"]})
+
+            # Texto que no es un computador (descarte rápido del agente): el
+            # frontend corta el flujo al ver tipo_equipo="Otro" -- no se guarda
+            # el formulario ni se estima precio, solo se registra y se cobra
+            # lo poco que costó la consulta.
+            if result.get("off_topic"):
+                yield "data: [DONE]\n\n"
+                usage = result.get("tokens")
+                analytics_service.log(
+                    session_id=session_id, user_email=user_email, tipo=f"category_{slug}_analizar",
+                    user_msg=texto, duration_ms=int((time.perf_counter() - t0) * 1000),
+                    n_updates=0, price_found=False, model=wiz_agent.model, blocked=True, block_reason="fuera de categoría",
+                )
+                await asyncio.to_thread(usage_service.add_usage, user_email, usage.total_tokens if usage else 0)
+                return
+
             if result.get("complement_updates"):
                 yield sse({"type": "ficha_update", "updates": result["complement_updates"]})
             if result.get("message"):
@@ -1325,19 +1460,87 @@ async def category_describe_endpoint(
     wiz_agent = _get_wizard_agent(slug)
     items = [item.dict() for item in body.items]
     if not items:
-        return {"descripciones": []}
-    descripciones = await wiz_agent.describe_batch(items)
+        return {"descripciones": [], "nombres": []}
+    descripciones, nombres = await wiz_agent.describe_and_name_batch(items)
     analytics_service.log(
         session_id="", user_email=user_email, tipo=f"category_{slug}_pdf_describe", n_updates=len(items),
     )
-    return {"descripciones": descripciones}
+    return {"descripciones": descripciones, "nombres": nombres}
+
+
+@app.post("/api/categories/{slug}/pdf")
+async def category_pdf_endpoint(
+    slug: str,
+    body: CategoryPdfRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    """PDF técnico del requerimiento (solo especificaciones y cantidades --
+    los precios van en el resumen ejecutivo de la plataforma, no acá).
+    Recibe los ítems ya con su nombre y descripción (el frontend los pide
+    antes con /describe y los guarda en el carrito)."""
+    schema = _get_category_schema_or_404(slug)
+    items = [item.dict() for item in body.items]
+    if not items:
+        raise HTTPException(status_code=400, detail="El requerimiento no tiene compras")
+    for it in items:
+        # Solo atributos del esquema y valores simples acotados (ver market_service)
+        it["atributos"] = market_service.sanitize_ficha(schema, it["atributos"])
+    pdf_bytes = await asyncio.to_thread(pdf_service.build_requirements_pdf, schema, items, body.session_id)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="especificaciones-tecnicas-{slug}.pdf"'},
+    )
+
+
+@app.post("/api/categories/{slug}/market")
+async def category_market_endpoint(
+    slug: str,
+    body: CategoryMarketRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    """Datos de mercado (evolución, proveedores, distribución) de cada ítem
+    del requerimiento, para el resumen ejecutivo. Solo lee datos históricos
+    públicos de Compra Ágil -- no toca el estado de ninguna sesión ni de
+    ningún usuario. Ver market_service para la validación de la ficha."""
+    schema = _get_category_schema_or_404(slug)
+    if not body.items:
+        raise HTTPException(status_code=400, detail="Sin ítems")
+
+    gate = asyncio.Semaphore(3)  # a lo más 3 consultas pesadas a la vez por petición
+
+    async def one(item: CategoryMarketItem) -> dict:
+        ficha = market_service.sanitize_ficha(schema, item.atributos)
+        relaxed = market_service.sanitize_relaxed(item.relaxed_attrs)
+        async with gate:
+            data = await asyncio.to_thread(market_service.analyze, ficha, relaxed, price_service)
+        # Enlace a cada compra en Compra Ágil (mismo formato que /offers); el
+        # resultado cacheado no se muta: se arma una copia de la serie.
+        serie = [
+            {**pt, "u": f"{_CA_BUSCADOR_BASE}?code={quote(pt['c'], safe='')}" if pt.get("c") else None}
+            for pt in data.get("serie", [])
+        ]
+        return {"id": item.id, **data, "serie": serie}
+
+    results = await asyncio.gather(*(one(i) for i in body.items))
+    analytics_service.log(
+        session_id="", user_email=user_email, tipo=f"category_{slug}_resumen_mercado", n_updates=len(body.items),
+    )
+    return {"items": results}
 
 
 @app.post("/api/categories/{slug}/reset/{session_id}")
-async def category_reset_endpoint(slug: str, session_id: str, _: str = Depends(require_api_key)):
+async def category_reset_endpoint(
+    slug: str, session_id: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+):
     _get_category_schema_or_404(slug)
     wiz_agent = _get_wizard_agent(slug)
     wiz_agent.reset_session(session_id)
+    # También limpia lo ya guardado en category_sessions (no solo la sesión
+    # en memoria) -- ver docstring de clear_ficha.
+    await asyncio.to_thread(category_session_service.clear_ficha, session_id, slug, user_email)
     return {"type": "reset_ok"}
 
 
@@ -1370,7 +1573,31 @@ async def resume_category_session_endpoint(
     # session_id (otra pestaña, otro día, o el backend se reinició entre
     # medio), y get_ficha()/estimate_price() leen del estado en memoria.
     wiz_agent.seed_session(session_id, saved["ficha"], saved["texto_original"])
-    return {"title": saved["title"], "ficha": saved["ficha"], "texto_original": saved["texto_original"]}
+    return {
+        "title": saved["title"],
+        "ficha": saved["ficha"],
+        "texto_original": saved["texto_original"],
+        "cart": saved["cart"],
+    }
+
+
+@app.post("/api/categories/{slug}/sessions/{session_id}/cart")
+async def save_category_cart_endpoint(
+    slug: str,
+    session_id: str,
+    body: CategorySaveCartRequest,
+    user_email: str = Depends(get_user_email),
+    _: str = Depends(require_api_key),
+):
+    """El carrito ("Mi cotización") es por formulario -- ver docstring de
+    category_session_service.save_cart. El frontend llama esto cada vez que
+    cambia (agregar/quitar/vaciar), igual que save_ficha se llama tras cada
+    analizar/manual_update."""
+    _get_category_schema_or_404(slug)
+    ok = await asyncio.to_thread(category_session_service.save_cart, session_id, slug, user_email, body.cart)
+    if not ok:
+        raise HTTPException(status_code=404, detail="No se pudo guardar el carrito")
+    return {"ok": True}
 
 
 @app.post("/api/categories/{slug}/sessions/{session_id}/rename")

@@ -431,6 +431,51 @@ class MedicamentoService:
             logging.warning(f"[Medicamentos] Error calculando principios activos combinados: {e}")
             return []
 
+    def get_market_rows(self, filters: Dict[str, Any], limit: int = 400) -> Tuple[List[Dict[str, Any]], int]:
+        """(filas, total) para los gráficos del resumen ejecutivo: solo precio
+        con IVA, fecha, laboratorio, nombre del producto y código de
+        requerimiento, más el total de coincidencias en la MISMA consulta.
+        Mismo filtro que estimate_price (_filter_clauses: valores enlazados
+        como parámetros; exige principio_activo y unidad_venta porque el
+        precio no es comparable entre unidades). Esta tabla no trae el
+        proveedor adjudicado, así que "proveedor" = laboratorio."""
+        engine = _get_engine()
+        if not engine or not filters.get("principio_activo") or not filters.get("unidad_venta"):
+            return [], 0
+        clauses, params = _filter_clauses(filters)
+        where_sql = " AND ".join(["nombre_producto IS NOT NULL", "precio_unitario_iva IS NOT NULL"] + clauses)
+        limit = max(1, min(int(limit), 1000))
+        sql = text(f"""
+            SELECT
+                precio_unitario_iva          AS precio_iva,
+                fecha_oferta::date::text     AS fecha,
+                laboratorio                  AS proveedor,
+                nombre_producto              AS descripcion,
+                codigo_requerimiento,
+                COUNT(*) OVER()              AS total
+            FROM "{_TABLE_NAME}"
+            WHERE {where_sql}
+            ORDER BY fecha_oferta DESC NULLS LAST
+            LIMIT {limit}
+        """)
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(sql, params).mappings().all()
+            total = int(rows[0]["total"]) if rows else 0
+            return [
+                {
+                    "precio_iva": int(r["precio_iva"]) if r["precio_iva"] else None,
+                    "fecha": r["fecha"],
+                    "proveedor": r["proveedor"] if r["proveedor"] and r["proveedor"] != "No especificado" else None,
+                    "descripcion": r["descripcion"],
+                    "codigo_requerimiento": r["codigo_requerimiento"],
+                }
+                for r in rows
+            ], total
+        except Exception as e:
+            logging.warning(f"[Medicamentos] Error en get_market_rows: {e}")
+            return [], 0
+
     def get_historial(
         self,
         filters: Dict[str, Any],

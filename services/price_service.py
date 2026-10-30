@@ -631,6 +631,63 @@ class PriceService:
             params["iqr_max"] = price_max
         return " AND ".join(where_clauses), params
 
+    def get_market_rows(
+        self,
+        ficha: Dict[str, Any],
+        limit: int = 400,
+        relaxed_attrs: Optional[List[str]] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """(filas, total) para los gráficos del resumen ejecutivo: solo las
+        columnas que se dibujan (precio, fecha, proveedor, descripción,
+        código de requerimiento) y el total de coincidencias en la MISMA
+        consulta (COUNT(*) OVER()), en vez de las ~30 columnas de
+        get_offer_rows() más un COUNT aparte. Mismo filtro que ese método
+        (_offer_rows_where: columnas de PRICE_QUERY_COLS, valores enlazados
+        como parámetros)."""
+        table = _resolve_table_name()
+        if not table or not ficha.get("tipo_equipo"):
+            return [], 0
+        built = self._offer_rows_where(ficha, None, None, relaxed_attrs)
+        if not built:
+            return [], 0
+        where_sql, params = built
+        limit = max(1, min(int(limit), 1000))
+        sql = text(f"""
+            SELECT
+                precio_unitario_iva::numeric   AS precio_iva,
+                fecha_modificacion::text       AS fecha,
+                razon_social_ganador           AS proveedor,
+                descripcion,
+                codigo_requerimiento,
+                COUNT(*) OVER()                AS total
+            FROM "{table}"
+            WHERE
+                LOWER(COALESCE(es_accesorio::text,'false')) != 'true'
+                AND precio_unitario::numeric > 200000
+                AND precio_unitario::numeric < 5000000
+                AND {where_sql}
+            ORDER BY fecha_modificacion DESC NULLS LAST
+            LIMIT {limit}
+        """)
+        try:
+            engine = _get_engine()
+            with engine.connect() as conn:
+                rows = conn.execute(sql, params).mappings().fetchall()
+            total = int(rows[0]["total"]) if rows else 0
+            return [
+                {
+                    "precio_iva": int(r["precio_iva"]) if r["precio_iva"] else None,
+                    "fecha": str(r["fecha"])[:10] if r["fecha"] else None,
+                    "proveedor": r["proveedor"],
+                    "descripcion": r["descripcion"],
+                    "codigo_requerimiento": r["codigo_requerimiento"],
+                }
+                for r in rows
+            ], total
+        except Exception as e:
+            logging.warning(f"[get_market_rows] Error: {e}")
+            return [], 0
+
     def count_offer_rows(
         self,
         ficha: Dict[str, Any],

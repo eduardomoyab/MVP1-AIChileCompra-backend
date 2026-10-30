@@ -78,8 +78,15 @@ flowchart TD
 | `POST` | `/api/medicamentos/manual_update/{session_id}` | **Sí** | **SSE** | Edición manual de un atributo del requerimiento |
 | `GET` | `/api/medicamentos/facets/{session_id}` | **Sí** | No | Valores reales + conteo de un atributo, acotados por lo ya elegido |
 | `GET` | `/api/medicamentos/historial/{session_id}` | **Sí** | No | Compras anteriores acotadas por los atributos elegidos (acordeón opcional) |
-| `POST` | `/api/medicamentos/describe` | **Sí** | No | Descripción IA por requerimiento del carrito, en batch (para el PDF) |
+| `POST` | `/api/medicamentos/describe` | **Sí** | No | Descripción IA y nombre corto por requerimiento del carrito, en batch. Devuelve `descripciones` y `nombres` |
+| `POST` | `/api/medicamentos/pdf` | **Sí** | No | PDF técnico del requerimiento de medicamentos (ReportLab, `application/pdf`): solo especificaciones y cantidades, **sin precios**. Máx. 50 ítems |
+| `POST` | `/api/medicamentos/market` | **Sí** | No | Datos de mercado por ítem para el resumen ejecutivo (evolución de precios, laboratorios y distribución). El «proveedor» es el laboratorio. Máx. 12 ítems por llamada |
 | `POST` | `/api/medicamentos/reset/{session_id}` | **Sí** | No | Reiniciar sesión — Medicamentos |
+| `POST` | `/api/categories/{slug}/describe` | **Sí** | No | Descripción y nombre corto (máx. 60 caracteres, sin destino de la compra) por ítem del carrito, en una sola llamada. Devuelve `descripciones` y `nombres` |
+| `POST` | `/api/categories/{slug}/pdf` | **Sí** | No | PDF técnico del requerimiento (ReportLab, `application/pdf`): solo especificaciones y cantidades, **sin precios**. Máx. 50 ítems |
+| `POST` | `/api/categories/{slug}/market` | **Sí** | No | Datos de mercado por ítem para el resumen ejecutivo: evolución de precios, proveedores y distribución, desde las transacciones históricas de Compra Ágil. Máx. 12 ítems por llamada |
+
+**Notas de seguridad de `/pdf` y `/market`:** ambos reciben la ficha desde el cliente, así que `services/market_service.sanitize_ficha` deja solo atributos del esquema con valores simples y acotados (los `relaxed_attrs` solo pueden ser columnas de `PRICE_QUERY_COLS`); no hay SQL nuevo (se reutilizan `price_service.get_offer_rows/count_offer_rows`, con parámetros enlazados); las respuestas llevan solo agregados (fecha, precio, proveedor), nunca filas completas; `/market` cachea por contenido de la ficha 10 min y acota concurrencia. El PDF usa fuentes y logos de `assets/` (Inter, licencia OFL en `assets/fonts/OFL.txt`).
 
 Autenticación: header `x-api-key: <FRONTEND_API_KEY>`.
 

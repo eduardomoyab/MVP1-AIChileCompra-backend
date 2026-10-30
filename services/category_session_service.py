@@ -60,10 +60,17 @@ def ensure_table() -> None:
                     title_is_custom BOOLEAN NOT NULL DEFAULT false,
                     ficha           JSONB NOT NULL DEFAULT '{}'::jsonb,
                     texto_original  TEXT,
+                    cart            JSONB NOT NULL DEFAULT '[]'::jsonb,
                     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """))
+            # ALTER ... ADD COLUMN IF NOT EXISTS es idempotente -- para las
+            # tablas que ya existían antes de que "cart" se agregara acá
+            # (CREATE TABLE IF NOT EXISTS no toca una tabla que ya existe).
+            conn.execute(text(
+                "ALTER TABLE category_sessions ADD COLUMN IF NOT EXISTS cart JSONB NOT NULL DEFAULT '[]'::jsonb"
+            ))
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_category_sessions_slug_email "
                 "ON category_sessions (slug, email, updated_at DESC)"
@@ -121,6 +128,7 @@ def save_ficha(
                         SET ficha = EXCLUDED.ficha,
                             texto_original = COALESCE(category_sessions.texto_original, EXCLUDED.texto_original),
                             updated_at = now()
+                    WHERE category_sessions.email = EXCLUDED.email
                     """),
                     {"sid": session_id, "slug": slug, "email": email, "ficha": json.dumps(ficha), "texto": texto_original},
                 )
@@ -132,6 +140,7 @@ def save_ficha(
                         ON CONFLICT (session_id) DO UPDATE
                         SET ficha = EXCLUDED.ficha,
                             updated_at = now()
+                    WHERE category_sessions.email = EXCLUDED.email
                     """),
                     {"sid": session_id, "slug": slug, "email": email, "ficha": json.dumps(ficha)},
                 )
@@ -157,7 +166,7 @@ def list_sessions(slug: str, email: str) -> List[Dict[str, Any]]:
         with engine.connect() as conn:
             rows = conn.execute(
                 text("""
-                    SELECT session_id, title, updated_at
+                    SELECT session_id, title, updated_at, jsonb_array_length(cart) AS n_compras
                     FROM category_sessions
                     WHERE slug = :slug AND email = :email
                     ORDER BY updated_at DESC
@@ -170,6 +179,7 @@ def list_sessions(slug: str, email: str) -> List[Dict[str, Any]]:
                     "session_id": r["session_id"],
                     "title": r["title"] or "Nuevo formulario",
                     "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                    "n_compras": r["n_compras"] or 0,
                 }
                 for r in rows
             ]
@@ -188,7 +198,7 @@ def get_full_session(session_id: str, slug: str, email: str) -> Optional[Dict[st
         with engine.connect() as conn:
             row = conn.execute(
                 text("""
-                    SELECT title, ficha, texto_original
+                    SELECT title, ficha, texto_original, cart
                     FROM category_sessions WHERE session_id = :sid AND slug = :slug AND email = :email
                 """),
                 {"sid": session_id, "slug": slug, "email": email},
@@ -199,10 +209,76 @@ def get_full_session(session_id: str, slug: str, email: str) -> Optional[Dict[st
                 "title": row["title"] or "Nuevo formulario",
                 "ficha": row["ficha"] or {},
                 "texto_original": row["texto_original"] or "",
+                "cart": row["cart"] if row["cart"] is not None else [],
             }
     except Exception as e:
         logging.warning(f"[category_session] Error leyendo formulario '{session_id}': {e}")
         return None
+
+
+def clear_ficha(session_id: str, slug: str, email: str) -> bool:
+    """Limpia la ficha/texto en curso de un formulario sin borrar la fila
+    completa (el carrito y el título quedan intactos) -- usado cuando se
+    descarta un borrador sin agregarlo al carrito (ver
+    POST /api/categories/{slug}/reset/{session_id} en main.py). Antes ese
+    endpoint solo reseteaba la sesión en memoria del wizard agent, nunca lo
+    que ya había quedado guardado acá -- con el auto-retomado de sesión al
+    recargar la página (ver CURRENT_SESSION_KEY en category_wizard.js), eso
+    hacía que un borrador recién descartado volviera a aparecer entero tras
+    un refresh."""
+    engine = _get_engine()
+    if not engine or not session_id or not email:
+        return False
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("""
+                    UPDATE category_sessions
+                    SET ficha = '{}'::jsonb, texto_original = NULL, updated_at = now()
+                    WHERE session_id = :sid AND slug = :slug AND email = :email
+                """),
+                {"sid": session_id, "slug": slug, "email": email},
+            )
+            conn.commit()
+            return result.rowcount > 0
+    except Exception as e:
+        logging.warning(f"[category_session] Error limpiando ficha de '{session_id}': {e}")
+        return False
+
+
+def save_cart(session_id: str, slug: str, email: str, cart: List[Dict[str, Any]]) -> bool:
+    """El carrito ("Mi cotización") es por formulario, no global -- reporte
+    real: "cuando presiono nuevo formulario, me aparecen cosas... pre
+    cargadas" / "cuando accedo a la página o actualizo, también me sale como
+    de la última compra". Antes vivía solo en sessionStorage del navegador,
+    sin relación con el session_id -- cualquier formulario (o un refresh,
+    que antes SIEMPRE generaba un session_id nuevo) veía el mismo carrito
+    "fantasma". Guardarlo acá, atado al session_id como el resto de la
+    ficha, es lo que permite que cada formulario tenga sus propias compras
+    y que retomar uno del historial las traiga de vuelta.
+    Upsert igual que save_ficha -- puede llegar antes de que exista fila
+    (ej. "vaciar cotización" en un formulario que recién se está creando)."""
+    engine = _get_engine()
+    if not engine or not session_id or not email:
+        return False
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO category_sessions (session_id, slug, email, cart, updated_at)
+                    VALUES (:sid, :slug, :email, CAST(:cart AS JSONB), now())
+                    ON CONFLICT (session_id) DO UPDATE
+                    SET cart = EXCLUDED.cart,
+                        updated_at = now()
+                WHERE category_sessions.email = EXCLUDED.email
+                """),
+                {"sid": session_id, "slug": slug, "email": email, "cart": json.dumps(cart)},
+            )
+            conn.commit()
+            return True
+    except Exception as e:
+        logging.warning(f"[category_session] Error guardando carrito de '{session_id}': {e}")
+        return False
 
 
 def rename(session_id: str, slug: str, email: str, title: str) -> bool:
