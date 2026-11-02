@@ -2,9 +2,14 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.27.0
 python-dotenv>=1.0.0
 openai>=1.59.0
-# sentence-transformers solo se necesita con EMBEDDING_PROVIDER=local (~500 MB RAM)
-# Comentar si se usa EMBEDDING_PROVIDER=openai para reducir memoria en producción
-sentence-transformers>=3.4.0
+# sentence-transformers solo se necesita con EMBEDDING_PROVIDER=local (~500 MB RAM).
+# Producción usa EMBEDDING_PROVIDER=openai (ver .env) -- comentado porque arrastra
+# torch (incluye ruedas CUDA en Linux por defecto, varios GB, sin uso en este
+# contenedor sin GPU). Esto es lo que inflaba el build a ~49 min de pip install y
+# la imagen final a ~3 GB. El import en agents/get_embeddings.py ya es perezoso
+# (_make_local_encoder, solo se llama si EMBEDDING_PROVIDER != "openai") -- si algún
+# día se vuelve a EMBEDDING_PROVIDER=local, hay que descomentar esta línea primero.
+# sentence-transformers>=3.4.0
 faiss-cpu>=1.9.0
 pandas>=2.0.0
 psycopg2-binary>=2.9.0

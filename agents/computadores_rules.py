@@ -23,6 +23,9 @@ y no se movieron acá porque no aplican a una extracción de una sola
 pasada como la del wizard.
 """
 
+import re
+from typing import Optional
+
 from agents import convenio_marco_gamas
 
 CATEGORIA = "Computadores"
@@ -247,6 +250,41 @@ Señales de que el input es una descripción técnica:
 
 
 TIPO_EQUIPO_REMINDER_TEXT = """**No te olvides de `tipo_equipo` (causa de bugs reales -- la estimación de precio depende de este atributo y nunca aparece si falta):** si el mensaje dice o deja claro el tipo de equipo ("laptop", "notebook", "desktop", "PC de escritorio", "all-in-one", "AIO"), inclúyelo SIEMPRE en `ficha_updates` en ese mismo turno, junto con el resto de los atributos que puedas determinar -- no dejes que la atención en mapear RAM/procesador/disco/otros datos te haga olvidar este atributo, que es independiente y tan importante como los demás."""
+
+
+# Reporte real: con un texto TAN explícito como "DOS (2) NOTEBOOKS..." el
+# LLM, pese al reminder de arriba, igual omite tipo_equipo de ficha_updates
+# en aprox. 1 de cada 8 pasadas (medido con 8 corridas reales a temperature
+# 0.2) -- un prompt nunca llega a 0% de esto, es inherentemente probabilístico.
+# Esta es la red de seguridad determinística: si el LLM no lo detectó pero el
+# texto usa una palabra inequívoca, se completa por código, no por IA. Solo
+# actúa cuando el texto calza con EXACTAMENTE una categoría -- ante ambigüedad
+# (ej. menciona "notebook" y "de escritorio" en el mismo texto) no adivina,
+# deja tipo_equipo sin asignar como ya hacía antes de este fallback.
+_TIPO_EQUIPO_FALLBACK_PATTERNS = {
+    "Laptop": [r"\bnotebooks?\b", r"\blaptops?\b", r"\bport[aá]tiles?\b"],
+    "AIO": [r"\ball[\s-]?in[\s-]?one\b", r"\baio\b"],
+    "Desktop": [
+        r"\bdesktops?\b",
+        r"\bequipos?\s+de\s+escritorio\b",
+        r"\bcomputadora?s?\s+de\s+escritorio\b",
+        r"\bpc\s+de\s+escritorio\b",
+        r"\btorres?\b",
+    ],
+}
+
+
+def infer_tipo_equipo_fallback(texto: str) -> Optional[str]:
+    """Ver comentario arriba de _TIPO_EQUIPO_FALLBACK_PATTERNS. Devuelve el
+    tipo detectado por palabra clave, o None si no hay match o hay más de
+    una categoría mencionada a la vez (ambiguo)."""
+    texto_low = texto.lower()
+    matched = [
+        tipo
+        for tipo, patterns in _TIPO_EQUIPO_FALLBACK_PATTERNS.items()
+        if any(re.search(p, texto_low) for p in patterns)
+    ]
+    return matched[0] if len(matched) == 1 else None
 
 
 def min_specs_section_text() -> str:

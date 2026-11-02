@@ -49,6 +49,7 @@ from agents.computadores_rules import (
     EXPLICIT_DECISION_RULE_TEXT,
     TECHNICAL_DESCRIPTION_RULE_TEXT,
     TIPO_EQUIPO_REMINDER_TEXT,
+    infer_tipo_equipo_fallback,
 )
 
 load_dotenv()
@@ -238,6 +239,24 @@ class ComputadoresWizardAgent:
             })
             session["ficha"][attr] = normalized_value
             complement_updates.extend(self._apply_complements(session, attr, normalized_value))
+
+        # Red de seguridad determinística -- ver infer_tipo_equipo_fallback.
+        # Solo entra si el LLM no lo trajo en ESTE turno y la sesión todavía
+        # no lo tiene de un turno anterior.
+        if (
+            session["ficha"].get("tipo_equipo") is None
+            and not any(u["attribute"] == "tipo_equipo" for u in ficha_updates)
+        ):
+            fallback_tipo = infer_tipo_equipo_fallback(texto)
+            if fallback_tipo:
+                ficha_updates.append({
+                    "attribute": "tipo_equipo",
+                    "value": fallback_tipo,
+                    "source": "ai",
+                    "normalized": True,
+                    "score": 1.0,
+                })
+                session["ficha"]["tipo_equipo"] = fallback_tipo
 
         return {
             "message": ai_message,
