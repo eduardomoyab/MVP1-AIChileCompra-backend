@@ -246,6 +246,9 @@ Señales de que el input es una descripción técnica:
 - Tiene formato de lista o especificación de compra pública"""
 
 
+TIPO_EQUIPO_REMINDER_TEXT = """**No te olvides de `tipo_equipo` (causa de bugs reales -- la estimación de precio depende de este atributo y nunca aparece si falta):** si el mensaje dice o deja claro el tipo de equipo ("laptop", "notebook", "desktop", "PC de escritorio", "all-in-one", "AIO"), inclúyelo SIEMPRE en `ficha_updates` en ese mismo turno, junto con el resto de los atributos que puedas determinar -- no dejes que la atención en mapear RAM/procesador/disco/otros datos te haga olvidar este atributo, que es independiente y tan importante como los demás."""
+
+
 def min_specs_section_text() -> str:
     """Bloque "ESPECIFICACIONES MÍNIMAS SEGÚN USO" -- los pisos mínimos por
     tipo de uso (oficina básico, oficina exigente, diseño/video/IA), que
@@ -260,7 +263,7 @@ def min_specs_section_text() -> str:
 
 Usa siempre el mínimo adecuado. No pongas más de lo necesario. Cuando el uso declarado corresponda razonablemente a una Gama oficial del Convenio Marco vigente, usa esa Gama como base (mismos valores que en RECONOCIMIENTO DE GAMA, no inventes otros números) y dilo explícitamente en tu mensaje — igual que si el usuario hubiera pedido la gama directamente. Si después el usuario pide algo puntual distinto a lo que sugiere la gama, respeta lo que pide (Regla 0) por sobre la gama — la gama es solo el punto de partida.
 
-**No te olvides de `tipo_equipo` (causa de bugs reales — la estimación de precio depende de este atributo y nunca aparece si falta):** si el mismo mensaje donde describe el uso también dice o deja claro el tipo de equipo ("laptop", "notebook", "desktop", "PC de escritorio", "all-in-one", "AIO"), inclúyelo en `ficha_updates` en ESE MISMO turno, junto con las specs de la gama — no dejes que la atención en mapear RAM/procesador/disco de la gama te haga olvidar este atributo, que es independiente y tan importante como los demás.
+{TIPO_EQUIPO_REMINDER_TEXT}
 
 - **Trabajo de oficina básico** (Word, Excel, correo, navegación): por debajo de la Gama 2 oficial — 8 GB RAM, 256 GB disco, sin GPU dedicada. Es una estimación propia, no una gama oficial (el Convenio Marco no define una Gama 1 para este uso tan liviano); acláraselo al usuario igual que en RECONOCIMIENTO DE GAMA.
 - **Trabajo de oficina con programas exigentes / Programación y desarrollo de software / Diseño gráfico y edición de fotos**: equivale a **Gama 2** del Convenio Marco vigente — {gama2_summary}.

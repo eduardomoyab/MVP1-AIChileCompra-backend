@@ -882,6 +882,18 @@ async def get_medicamentos_schema():
     return {"categoria": "Medicamentos", "attributes": schema, "core_attrs": CORE_ATTRS_MED}
 
 
+async def _ensure_med_session(session_id: str, user_email: str) -> None:
+    """La ficha en curso vive en memoria: si el proceso se reinició (deploy,
+    recarga) o nunca vio este session_id, se re-siembra desde lo guardado en
+    category_sessions. Sin esto, un paso posterior trabajaba con una ficha
+    vacía (listas sin sugerencias) y pisaba la ficha guardada con una parcial."""
+    if medicamento_agent.has_session(session_id):
+        return
+    saved = await asyncio.to_thread(category_session_service.get_full_session, session_id, "medicamentos", user_email)
+    if saved:
+        medicamento_agent.seed_session(session_id, saved["ficha"], saved["texto_original"])
+
+
 @app.post("/api/medicamentos/analizar/{session_id}")
 async def medicamentos_analizar_endpoint(
     session_id: str,
@@ -889,6 +901,7 @@ async def medicamentos_analizar_endpoint(
     user_email: str = Depends(get_user_email),
     _: str = Depends(require_api_key),
 ):
+    await _ensure_med_session(session_id, user_email)
     texto = body.texto.strip()
     if not texto:
         async def empty():
@@ -921,6 +934,13 @@ async def medicamentos_analizar_endpoint(
 
             price_found = False
             ficha = medicamento_agent.get_ficha(session_id)
+            # Guardado incremental para el historial (mismo mecanismo que el
+            # wizard genérico, ver category_session_service.py).
+            if ficha:
+                await asyncio.to_thread(
+                    category_session_service.save_ficha,
+                    session_id, "medicamentos", user_email, ficha, texto,
+                )
             if ficha.get("principio_activo"):
                 try:
                     price = await asyncio.to_thread(medicamento_service.estimate_price, ficha)
@@ -975,6 +995,8 @@ async def medicamentos_manual_update_endpoint(
             yield "data: [DONE]\n\n"
         return StreamingResponse(err(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
+    await _ensure_med_session(session_id, user_email)
+
     async def event_gen():
         t0 = time.perf_counter()
         try:
@@ -985,6 +1007,10 @@ async def medicamentos_manual_update_endpoint(
 
             price_found = False
             ficha = medicamento_agent.get_ficha(session_id)
+            if ficha:
+                await asyncio.to_thread(
+                    category_session_service.save_ficha, session_id, "medicamentos", user_email, ficha,
+                )
             if ficha.get("principio_activo"):
                 try:
                     price = await asyncio.to_thread(medicamento_service.estimate_price, ficha)
@@ -1022,8 +1048,10 @@ async def medicamentos_manual_update_endpoint(
 async def get_medicamentos_facets(
     session_id: str,
     attr: str,
+    user_email: str = Depends(get_user_email),
     _: str = Depends(require_api_key),
 ):
+    await _ensure_med_session(session_id, user_email)
     ficha = medicamento_agent.get_ficha(session_id)
     values = await asyncio.to_thread(medicamento_service.get_facet_values, attr, ficha)
     return {"attribute": attr, "values": values}
@@ -1032,15 +1060,20 @@ async def get_medicamentos_facets(
 @app.get("/api/medicamentos/precio_por_unidad/{session_id}")
 async def get_medicamentos_precio_por_unidad(
     session_id: str,
+    user_email: str = Depends(get_user_email),
     _: str = Depends(require_api_key),
 ):
+    await _ensure_med_session(session_id, user_email)
     ficha = medicamento_agent.get_ficha(session_id)
     values = await asyncio.to_thread(medicamento_service.get_price_by_unidad, ficha)
     return {"attribute": "unidad_venta", "values": values}
 
 
 @app.get("/api/medicamentos/companions/{session_id}")
-async def get_medicamentos_companions(session_id: str, _: str = Depends(require_api_key)):
+async def get_medicamentos_companions(
+    session_id: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+):
+    await _ensure_med_session(session_id, user_email)
     ficha = medicamento_agent.get_ficha(session_id)
     values = await asyncio.to_thread(medicamento_service.get_companion_values, ficha)
     return {"attribute": "principio_activo", "values": values}
@@ -1053,6 +1086,7 @@ async def get_medicamentos_historial(
     user_email: str = Depends(get_user_email),
     _: str = Depends(require_api_key),
 ):
+    await _ensure_med_session(session_id, user_email)
     ficha = medicamento_agent.get_ficha(session_id)
     result = await asyncio.to_thread(medicamento_service.get_historial, ficha, sort, 30)
     result["results"] = _enrich_medicamentos(result.get("results", []))
@@ -1131,8 +1165,12 @@ async def medicamentos_market_endpoint(
 
 
 @app.post("/api/medicamentos/reset/{session_id}")
-async def medicamentos_reset_endpoint(session_id: str, _: str = Depends(require_api_key)):
+async def medicamentos_reset_endpoint(
+    session_id: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
+):
     medicamento_agent.reset_session(session_id)
+    # Igual que el wizard genérico: también limpia lo ya guardado del borrador.
+    await asyncio.to_thread(category_session_service.clear_ficha, session_id, "medicamentos", user_email)
     return {"type": "reset_ok"}
 
 
@@ -1153,6 +1191,17 @@ def _get_category_schema_or_404(slug: str):
     if not schema:
         raise HTTPException(status_code=404, detail=f"Categoría '{slug}' no soportada por el wizard")
     return schema
+
+
+# Medicamentos conserva su motor propio (endpoints /api/medicamentos/*), pero
+# comparte con el wizard genérico el historial de formularios (tabla
+# category_sessions): listar, retomar, carrito, renombrar y borrar.
+_HISTORY_EXTRA_SLUGS = {"medicamentos"}
+
+
+def _get_history_slug_or_404(slug: str) -> None:
+    if slug not in _HISTORY_EXTRA_SLUGS:
+        _get_category_schema_or_404(slug)
 
 
 def _get_wizard_agent(slug: str) -> ComputadoresWizardAgent:
@@ -1232,6 +1281,8 @@ async def category_analizar_endpoint(
 
             if result.get("complement_updates"):
                 yield sse({"type": "ficha_update", "updates": result["complement_updates"]})
+            if result.get("cantidad"):
+                yield sse({"type": "cantidad_update", "cantidad": result["cantidad"]})
             if result.get("message"):
                 yield sse({"type": "message", "text": result["message"]})
             if result.get("questions"):
@@ -1254,8 +1305,8 @@ async def category_analizar_endpoint(
                     break
             else:
                 try:
-                    price_data, cm_price_data = await asyncio.to_thread(
-                        category_service.estimate_price, schema, ficha, price_service, cm_service
+                    price_data, cm_price_data = await category_service.estimate_price_async(
+                        schema, ficha, price_service, cm_service
                     )
                     if price_data:
                         price_found = True
@@ -1336,8 +1387,8 @@ async def category_manual_update_endpoint(
                     break
             else:
                 try:
-                    price_data, cm_price_data = await asyncio.to_thread(
-                        category_service.estimate_price, schema, ficha, price_service, cm_service
+                    price_data, cm_price_data = await category_service.estimate_price_async(
+                        schema, ficha, price_service, cm_service
                     )
                     if price_data:
                         price_found = True
@@ -1397,8 +1448,8 @@ async def get_category_price(
     schema = _get_category_schema_or_404(slug)
     wiz_agent = _get_wizard_agent(slug)
     ficha = wiz_agent.get_ficha(session_id)
-    price_data, cm_price_data = await asyncio.to_thread(
-        category_service.estimate_price, schema, ficha, price_service, cm_service
+    price_data, cm_price_data = await category_service.estimate_price_async(
+        schema, ficha, price_service, cm_service
     )
     # Mismo criterio que _session_price_cache del chat legacy -- /offers
     # necesita el mismo relajo que usó estimate() para no filtrar con la
@@ -1555,7 +1606,7 @@ async def category_reset_endpoint(
 async def list_category_sessions_endpoint(
     slug: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
 ):
-    _get_category_schema_or_404(slug)
+    _get_history_slug_or_404(slug)
     sessions = await asyncio.to_thread(category_session_service.list_sessions, slug, user_email)
     return {"sessions": sessions}
 
@@ -1564,8 +1615,8 @@ async def list_category_sessions_endpoint(
 async def resume_category_session_endpoint(
     slug: str, session_id: str, user_email: str = Depends(get_user_email), _: str = Depends(require_api_key)
 ):
-    _get_category_schema_or_404(slug)
-    wiz_agent = _get_wizard_agent(slug)
+    _get_history_slug_or_404(slug)
+    wiz_agent = medicamento_agent if slug == "medicamentos" else _get_wizard_agent(slug)
     saved = await asyncio.to_thread(category_session_service.get_full_session, session_id, slug, user_email)
     if not saved:
         raise HTTPException(status_code=404, detail="Formulario no encontrado")
@@ -1593,7 +1644,7 @@ async def save_category_cart_endpoint(
     category_session_service.save_cart. El frontend llama esto cada vez que
     cambia (agregar/quitar/vaciar), igual que save_ficha se llama tras cada
     analizar/manual_update."""
-    _get_category_schema_or_404(slug)
+    _get_history_slug_or_404(slug)
     ok = await asyncio.to_thread(category_session_service.save_cart, session_id, slug, user_email, body.cart)
     if not ok:
         raise HTTPException(status_code=404, detail="No se pudo guardar el carrito")

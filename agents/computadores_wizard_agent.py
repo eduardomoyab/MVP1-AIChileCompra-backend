@@ -48,6 +48,7 @@ from agents.computadores_rules import (
     MULTI_VALUE_RULE_TEXT,
     EXPLICIT_DECISION_RULE_TEXT,
     TECHNICAL_DESCRIPTION_RULE_TEXT,
+    TIPO_EQUIPO_REMINDER_TEXT,
 )
 
 load_dotenv()
@@ -76,6 +77,8 @@ Tu misión es, a partir de la descripción que el usuario escriba, extraer todos
 
 **NUNCA incluyas en ficha_updates**: nucleos_procesador, hilos_procesador, frecuencia_turbo_procesador_mhz, frecuencia_ram_mhz, total_vram_gpu_gb, generacion_procesador, tecnologia_gpu_principal. Esos se completan solos.
 
+{TIPO_EQUIPO_REMINDER_TEXT}
+
 {PROCESADOR_DISTINCTION_TEXT}
 
 {BRAND_NEUTRALITY_TEXT}
@@ -100,10 +103,11 @@ Tu misión es, a partir de la descripción que el usuario escriba, extraer todos
 
 Responde SIEMPRE con un único objeto JSON válido, nada más (sin texto antes ni después), con esta forma exacta:
 
-{{"titulo": "[título corto, 3-6 palabras]", "message": "[mensaje breve, máximo 2 oraciones]", "ficha_updates": {{...}}, "questions": [...]}}
+{{"titulo": "[título corto, 3-6 palabras]", "message": "[mensaje breve, máximo 2 oraciones]", "ficha_updates": {{...}}, "cantidad": [número o null], "questions": [...]}}
 
 - **titulo**: como el título de una conversación de ChatGPT -- 3 a 6 palabras que resuman el requerimiento (ej. "AIO oficina Intel i5", "Laptop gama 2 diseño"), nunca una oración completa ni repite literalmente el texto del usuario.
 - **ficha_updates**: solo los atributos que puedas determinar con confianza real. Omite los que no sepas -- no rellenes por rellenar.
+- **cantidad**: cuántas UNIDADES del equipo se van a comprar (no una especificación del equipo en sí) -- un número entero SOLO si el usuario lo dice explícitamente como cantidad de equipos (ej. "dos (2) notebooks", "cinco computadores", "necesito 3 equipos"), si no `null`. **Nunca confundas esto con una especificación técnica numérica** (16 GB de RAM, 512 GB de disco, 15.6 pulgadas, Windows 11, etc. NO son cantidad, son atributos de ficha_updates). Ej: "dos notebooks con 16 GB de RAM" → `"cantidad": 2` (el "16" es RAM, no cantidad). Si el texto no menciona cuántos equipos, deja `cantidad: null` -- el usuario decide eso aparte, con un valor por defecto de 1.
 - **questions**: máximo UNA pregunta (lista vacía `[]` casi siempre).
 - Para numéricos: solo el número, sin unidad. Ej: 16, no "16 GB".
 - Para booleanos: true o false (sin comillas)."""
@@ -200,6 +204,18 @@ class ComputadoresWizardAgent:
         questions = parsed.get("questions", []) or []
         threshold = float(os.getenv("SIMILARITY_THRESHOLD", "0.82"))
 
+        # Reporte real: "esa cantidad requerida estaría muy bacán que también
+        # la detectara automáticamente". Validado acá (no solo confiado al
+        # LLM) -- cualquier cosa que no sea un entero positivo se descarta en
+        # silencio, el campo de cantidad en el wizard ya tiene su propio
+        # default de 1.
+        raw_cantidad = parsed.get("cantidad")
+        cantidad = None
+        if isinstance(raw_cantidad, (int, float)) and not isinstance(raw_cantidad, bool):
+            cantidad_int = int(raw_cantidad)
+            if cantidad_int > 0:
+                cantidad = cantidad_int
+
         ficha_updates = []
         complement_updates = []
 
@@ -228,6 +244,7 @@ class ComputadoresWizardAgent:
             "titulo": titulo,
             "ficha_updates": ficha_updates,
             "complement_updates": complement_updates,
+            "cantidad": cantidad,
             "questions": questions,
             "tokens": usage,
         }

@@ -16,6 +16,7 @@ siendo responsabilidad exclusiva de CMService -- acá solo se decide si se
 le pregunta o no.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -74,6 +75,27 @@ def estimate_price(
     # "todo" en vez del default (20) es barato y permite paginar la lista
     # completa en el cliente sin un segundo viaje al backend.
     cm_price_data = cm_service.estimate(ficha, top_n=200) if schema.supports_convenio_marco else None
+    return price_data, cm_price_data
+
+
+async def estimate_price_async(
+    schema: CategorySchema,
+    ficha: Dict[str, Any],
+    price_service: PriceService,
+    cm_service: CMService,
+) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Igual que estimate_price(), pero corre Compra Ágil y Convenio Marco EN
+    PARALELO (dos hilos vía asyncio.to_thread) en vez de uno tras otro --
+    ambas son consultas de red/DB independientes entre sí (PriceService y
+    CMService usan motores de conexión separados), así que la latencia total
+    pasa de (CA + CM) a max(CA, CM). Reporte real: el wizard "se queda
+    cargando" tras cada paso del core -- este es el punto donde más tiempo
+    se gasta por turno en /analizar y /manual_update."""
+    price_task = asyncio.to_thread(price_service.estimate, ficha)
+    if not schema.supports_convenio_marco:
+        return await price_task, None
+    cm_task = asyncio.to_thread(cm_service.estimate, ficha, 200)
+    price_data, cm_price_data = await asyncio.gather(price_task, cm_task)
     return price_data, cm_price_data
 
 

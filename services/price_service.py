@@ -741,7 +741,7 @@ class PriceService:
         if not built:
             return []
         where_sql, params = built
-        sql = text(f"""
+        slow_sql = text(f"""
             SELECT
                 codigo_requerimiento,
                 precio_unitario::numeric        AS precio_unitario,
@@ -783,10 +783,65 @@ class PriceService:
             ORDER BY fecha_modificacion DESC NULLS LAST
             LIMIT {limit} OFFSET {offset}
         """)
+        # Reporte real: paginar esta lista "se queda cargando unos segundos"
+        # -- EXPLAIN ANALYZE confirmó la causa: "PrecioCA" resuelve
+        # fecha_modificacion/codigo_oc/razon_social con un LEFT JOIN a
+        # "Oferta" vía una subconsulta `DISTINCT ON (id)` (redundante -- id
+        # YA es la PK, nada que deduplicar) que el planner no puede acotar
+        # por nuestro WHERE y termina escaneando la tabla completa (2M+
+        # filas, ~2.3s fijos en cada llamada, sin importar cuántas filas
+        # matcheen). Acá se filtra extractor_combined/OfertaProducto PRIMERO
+        # (igual que _FAST_CM_QUERY en cm_service.py) y recién después, ya
+        # con el puñado de filas que matchean, se hace el join directo a
+        # Oferta (por PK, sin DISTINCT ON) y OC_productos -- mismo resultado
+        # que la vista, verificado fila por fila contra ella antes de
+        # reemplazarla, en ~0.1-0.3s en vez de ~2.3s.
+        fast_sql = text(f"""
+            WITH filtered AS (
+                SELECT
+                    ec.id_oferta_producto_aquiles, op.oferta_id,
+                    op.precio_unitario::numeric AS precio_unitario,
+                    op.precio_unitario_iva::numeric AS precio_unitario_iva,
+                    op.descripcion, ec.codigo_requerimiento,
+                    ec.marca, ec.procesador_principal, ec.total_ram_gb, ec.tecnologia_ram,
+                    ec.total_almacenamiento_gb, ec.tecnologia_disco_principal, ec.tiene_gpu_dedicada,
+                    ec.sistema_operativo, ec.tipo_equipo, ec.linea_producto, ec.nombre_modelo,
+                    ec.linea_procesador, ec.generacion_procesador, ec.hilos_procesador,
+                    ec.frecuencia_turbo_procesador_mhz, ec.frecuencia_ram_mhz, ec.tipo_configuracion_discos,
+                    ec.gpu_dedicada_nombre, ec.total_vram_gpu_gb, ec.tecnologia_gpu_principal,
+                    ec.pantalla_pulgadas, ec.wifi_generacion, ec.part_number
+                FROM extractor_combined ec
+                JOIN "OfertaProducto" op ON op._id_aquiles = ec.id_oferta_producto_aquiles::integer
+                WHERE
+                    ec."ROWNUM" IS NOT NULL
+                    AND (ec.tipo_equipo <> 'Otro' OR ec.es_accesorio <> 'true')
+                    AND LOWER(COALESCE(ec.es_accesorio::text,'false')) != 'true'
+                    AND (op.precio_unitario IS NOT NULL OR op.precio_unitario_iva IS NOT NULL)
+                    AND op.precio_unitario::numeric > 200000
+                    AND op.precio_unitario::numeric < 5000000
+                    AND {where_sql}
+            ),
+            paged AS (
+                SELECT f.*, o.fecha_modificacion::text AS fecha_modificacion, o._id_aquiles AS id_oferta_aquiles
+                FROM filtered f
+                LEFT JOIN "Oferta" o ON o.id = f.oferta_id
+                ORDER BY o.fecha_modificacion DESC NULLS LAST
+                LIMIT {limit} OFFSET {offset}
+            )
+            SELECT paged.*, oc.codigo_oc, oc.razon_social_ganador
+            FROM paged
+            LEFT JOIN "OC_productos" oc ON oc.id_oferta_producto_aquiles = paged.id_oferta_producto_aquiles::bigint
+            ORDER BY paged.fecha_modificacion DESC NULLS LAST
+        """)
         try:
             engine = _get_engine()
             with engine.connect() as conn:
-                rows = conn.execute(sql, params).mappings().fetchall()
+                try:
+                    rows = conn.execute(fast_sql, params).mappings().fetchall()
+                except Exception as e:
+                    logging.warning(f"[get_offer_rows] Query rápida falló, usando la lenta: {e}")
+                    conn.rollback()  # la conexión queda con la transacción abortada tras el error
+                    rows = conn.execute(slow_sql, params).mappings().fetchall()
             return [
                 {
                     "codigo_requerimiento": row["codigo_requerimiento"],

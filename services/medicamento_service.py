@@ -142,8 +142,15 @@ def _filter_clauses(filters: Dict[str, Any], exclude: Optional[str] = None) -> T
             params[k] = f"%{v}%"
 
     if exclude != "forma_farmaceutica" and filters.get("forma_farmaceutica"):
-        clauses.append("forma_farmaceutica ILIKE :ff")
-        params["ff"] = f"%{filters['forma_farmaceutica']}%"
+        # El valor puede venir normalizado al catálogo en plural ("Comprimidos")
+        # mientras la base dice "COMPRIMIDO" (o al revés), y con/sin tilde
+        # ("Solución"/"SOLUCION"): se compara sin tildes y sin la "s" final,
+        # así singular y plural calzan en ambos sentidos.
+        ff = str(filters["forma_farmaceutica"]).strip()
+        if len(ff) > 3 and ff.lower().endswith("s"):
+            ff = ff[:-1]
+        clauses.append("unaccent(forma_farmaceutica) ILIKE unaccent(:ff)")
+        params["ff"] = f"%{ff}%"
 
     if exclude != "concentracion" and filters.get("concentracion"):
         clauses.append("(concentracion_1 ILIKE :conc OR concentracion_2 ILIKE :conc)")
@@ -366,6 +373,13 @@ class MedicamentoService:
         try:
             with engine.connect() as conn:
                 rows = conn.execute(sql, params).mappings().all()
+            # "Unidad" es una etiqueta genérica (cada comprador la usa para una
+            # presentación distinta) y su precio mezcla cosas no comparables:
+            # si ya hay 2 o más opciones específicas, se oculta de la lista.
+            # (Las compras "Unidad" equivalentes igual se suman al elegir la
+            # forma concreta, ver _filter_clauses.)
+            if sum(1 for r in rows if str(r["valor"]).strip().lower() != "unidad") >= 2:
+                rows = [r for r in rows if str(r["valor"]).strip().lower() != "unidad"]
             return [{
                 "value": r["valor"],
                 "count": int(r["n"]),

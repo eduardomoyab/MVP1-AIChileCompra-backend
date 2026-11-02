@@ -89,7 +89,9 @@ def _derive_title(ficha: Dict[str, Any], texto_original: str) -> str:
     # título se arma con lo que ya haya en la ficha, mismo criterio que
     # chat_session_service pero sin asumir un atributo fijo como tipo_equipo
     # (acá puede ser cualquier categoría futura).
-    partes = [str(v) for v in ficha.values() if isinstance(v, (str, int, float)) and str(v).strip()][:3]
+    # Los valores multi-selección (ej. principio_activo en Medicamentos) son listas.
+    planos = [", ".join(map(str, v)) if isinstance(v, list) else v for v in ficha.values()]
+    partes = [str(v) for v in planos if isinstance(v, (str, int, float)) and str(v).strip()][:3]
     return (" · ".join(partes))[:_TITLE_MAX_LEN] or "Nuevo formulario"
 
 

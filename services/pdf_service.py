@@ -201,7 +201,8 @@ def format_value(attr, value: Any) -> str:
         return getattr(attr, "joiner", " o ").join(parts)
     if isinstance(value, (int, float)):
         return _with_unit(value, unit)
-    return str(value)
+    # Atributos no numéricos: espacios limpios y en MAYÚSCULAS (igual que en pantalla).
+    return " ".join(str(value).split()).upper()
 
 
 def _has_value(v: Any) -> bool:

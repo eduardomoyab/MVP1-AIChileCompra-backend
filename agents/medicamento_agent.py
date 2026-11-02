@@ -397,6 +397,14 @@ Responde en JSON con esta forma exacta: {{"descripciones": ["párrafo del requer
     def cleanup_session(self, session_id: str) -> None:
         _med_sessions.pop(session_id, None)
 
+    def has_session(self, session_id: str) -> bool:
+        return session_id in _med_sessions
+
+    def seed_session(self, session_id: str, ficha: Dict[str, Any], texto_original: str = "") -> None:
+        """Re-siembra la ficha en memoria al retomar un formulario guardado
+        (ver category_session_service.py), igual que ComputadoresWizardAgent."""
+        _med_sessions[session_id] = {"texto_original": texto_original, "ficha": dict(ficha)}
+
     def _normalize(self, attribute: str, value: Any) -> Tuple[Any, float, List]:
         meta = FILLABLE_ATTRIBUTES_MED.get(attribute, {})
         attr_type = meta.get("type", "free")
