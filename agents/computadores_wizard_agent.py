@@ -49,20 +49,31 @@ from agents.computadores_rules import (
     EXPLICIT_DECISION_RULE_TEXT,
     TECHNICAL_DESCRIPTION_RULE_TEXT,
     TIPO_EQUIPO_REMINDER_TEXT,
+    gama_section_text,
     infer_tipo_equipo_fallback,
 )
 
 load_dotenv()
 
-# A diferencia del chat legacy, el wizard NO infiere un set completo de
-# atributos a partir de un uso declarado o una gama mencionada (eso vivía
-# en computadores_rules.gama_section_text()/min_specs_section_text(), que
-# este agente deliberadamente NO importa). Acá el uso/gama es, a lo más,
-# una sugerencia mencionada en el mensaje -- la ficha solo se completa con
-# lo explícito del texto o con los controles del wizard (chips, slider).
-USE_SUGGESTION_RULE_TEXT = """## USO O GAMA MENCIONADOS -- SOLO SUGERENCIA, NUNCA AUTOCOMPLETAR
+# A diferencia del chat legacy, el wizard NO infiere un set de atributos a
+# partir de un PROPÓSITO DE USO declarado (eso vivía en
+# computadores_rules.min_specs_section_text(), que este agente
+# deliberadamente NO importa) -- "para oficina" es un uso ambiguo, no un
+# valor. Una GAMA mencionada explícitamente es distinta: es, en la práctica,
+# una preconfiguración con nombre propio del Convenio Marco (reporte real:
+# "mencionar gama está bien... es como si también fuera un atributo, es una
+# preconfiguración ya"), así que sí se autocompleta -- mismo criterio que el
+# chat legacy, vía computadores_rules.gama_section_text() (import acá
+# arriba). Cada valor que trae igual pasa por el mismo paso de confirmación
+# ("Sugerido por IA") que cualquier otro atributo -- no se salta ningún
+# control del wizard. Si el usuario además da un valor explícito para algún
+# atributo puntual (ej. "gama alta con 8 GB de RAM"), REGLA 0 más arriba
+# (EXPLICIT_DECISION_RULE_TEXT) ya hace que ese valor explícito gane por
+# sobre el piso de la gama para ESE atributo -- el resto de la gama se
+# mantiene igual.
+USE_SUGGESTION_RULE_TEXT = """## PROPÓSITO DE USO MENCIONADO -- SOLO SUGERENCIA, NUNCA AUTOCOMPLETAR
 
-Si el usuario menciona un uso (ej. "para oficina", "para diseño gráfico") o una gama del Convenio Marco (ej. "gama 2", "gama alta"), NO llenes el resto de los atributos a partir de eso -- esto no es una ficha de piso mínimo, es una extracción literal de lo que el usuario escribió. Puedes mencionarlo como una sugerencia breve en el campo `message` (ej. "para oficina suele bastar con 8 GB de RAM y 256 GB de disco; puedes ajustarlo en los pasos siguientes"), pero esos valores NO van en `ficha_updates` salvo que el usuario además haya dado un número o especificación concreta."""
+Si el usuario menciona un PROPÓSITO DE USO (ej. "para oficina", "para diseño gráfico", "para programar") SIN mencionar una gama del Convenio Marco, NO llenes el resto de los atributos a partir de eso -- esto no es una ficha de piso mínimo por uso, es una extracción literal de lo que el usuario escribió. Puedes mencionarlo como una sugerencia breve en el campo `message` (ej. "para oficina suele bastar con 8 GB de RAM y 256 GB de disco; puedes ajustarlo en los pasos siguientes"), pero esos valores NO van en `ficha_updates` salvo que el usuario además haya dado un número o especificación concreta, o haya mencionado una gama (ver RECONOCIMIENTO DE GAMA más abajo, que si se autocompleta)."""
 
 
 def _build_system_prompt() -> str:
@@ -90,11 +101,13 @@ Tu misión es, a partir de la descripción que el usuario escriba, extraer todos
 
 {TECHNICAL_DESCRIPTION_RULE_TEXT}
 
+{gama_section_text()}
+
 {USE_SUGGESTION_RULE_TEXT}
 
 ## COMPORTAMIENTO
 
-1. Esto NO es una conversación -- es una sola extracción sobre el texto que te llega, no un chat con turnos. Nunca hagas preguntas de seguimiento abiertas tipo "¿para qué lo usarán?": extrae SOLO lo que el usuario dijo explícitamente -- si un dato no viene literalmente en el texto, déjalo vacío aunque se pueda adivinar por un uso o gama mencionados (ver regla de arriba). El usuario completa lo que falte después con los controles del asistente (chips, deslizadores), no respondiéndote a ti.
+1. Esto NO es una conversación -- es una sola extracción sobre el texto que te llega, no un chat con turnos. Nunca hagas preguntas de seguimiento abiertas tipo "¿para qué lo usarán?": extrae SOLO lo que el usuario dijo explícitamente -- si un dato no viene literalmente en el texto, déjalo vacío aunque se pueda adivinar por un uso declarado (si menciona una gama, sí se autocompleta -- ver RECONOCIMIENTO DE GAMA arriba). El usuario completa lo que falte después con los controles del asistente (chips, deslizadores), no respondiéndote a ti.
 2. Si el texto no da ninguna pista de atributos técnicos explícitos (ej. "necesito un computador" a secas, o solo describe un uso sin números ni specs), no inventes especificaciones -- deja `ficha_updates` vacío o con solo lo obvio (ej. tipo_equipo si se menciona), y dilo brevemente en el mensaje.
 3. `questions` casi siempre vacío -- solo úsalo si el texto es tan ambiguo que ni siquiera puedes determinar el tipo de equipo.
 4. Sé breve: máximo 2 oraciones en el mensaje.
