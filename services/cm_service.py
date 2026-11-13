@@ -524,24 +524,30 @@ class CMService:
         if ficha_lineas:
             fl_lower = {f.lower() for f in ficha_lineas}
             family_matches = [r for r in candidates if r["_familia"] and r["_familia"].lower() in fl_lower]
+
+            # El piso de una gama es un MÍNIMO, no un valor exacto (mismo
+            # criterio que RAM/almacenamiento con rangos {min,max} -- ver
+            # _numeric_match). Reporte real: pedir "notebook gama alta"
+            # (Intel Core i7/AMD Ryzen 7) nunca ofrecía equipos Premium
+            # (i9/Ryzen 9) aunque superan el piso pedido, porque el match
+            # exacto de línea ya alcanzaba candidatos y el fallback de "gama
+            # equivalente" (misma gama, otra marca) ni se evaluaba. Se amplía
+            # siempre al grupo de esa gama Y TODAS las superiores (cualquier
+            # marca) y se usa el resultado más amplio.
+            group_lower = {g.lower() for g in gama_service.expand_to_group_and_above(ficha_lineas)}
+            or_better_matches = [r for r in candidates if r["_familia"] and r["_familia"].lower() in group_lower]
+
+            if len(or_better_matches) > len(family_matches):
+                if family_matches:
+                    return or_better_matches, "gama", False, applied + ["línea proc. (o superior)"], unverified
+                return or_better_matches, "gama", True, applied + ["gama equivalente o superior"], unverified
             if family_matches:
                 return family_matches, "family", False, applied + ["línea proc."], unverified
 
-            # Sin match exacto de línea: relajar primero al grupo de líneas
-            # equivalentes en la misma gama (cualquier marca) antes de soltar
-            # el filtro de CPU por completo -- ver nota en el docstring del
-            # módulo. Evita que la relajación total termine mostrando solo lo
-            # que más abunda en el catálogo por marca.
-            group = gama_service.expand_to_group(ficha_lineas)
-            group_lower = {g.lower() for g in group} - fl_lower
-            if group_lower:
-                gama_matches = [r for r in candidates if r["_familia"] and r["_familia"].lower() in group_lower]
-                if gama_matches:
-                    return gama_matches, "gama", True, applied + ["gama equivalente"], unverified
-
-            # Tampoco hay nada en la misma gama — se relaja del todo (ver nota
-            # en el docstring del módulo sobre por qué no se usa similitud
-            # semántica acá) para no dejar el panel vacío solo por el CPU.
+            # Tampoco hay nada en esa gama o superiores — se relaja del todo
+            # (ver nota en el docstring del módulo sobre por qué no se usa
+            # similitud semántica acá) para no dejar el panel vacío solo por
+            # el CPU.
             return candidates, "none", True, applied, unverified
 
         return candidates, "none", False, applied, unverified

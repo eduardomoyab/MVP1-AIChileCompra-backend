@@ -55,26 +55,35 @@ def get_lineas_by_gama(gama: str) -> List[str]:
     return sorted(linea for linea, entry in linea_to_gama.items() if entry["gama"] == gama)
 
 
-def expand_to_group(lineas: List[str]) -> List[str]:
-    """Dada una línea (o lista de líneas), devuelve el grupo completo cross-marca de
-    su(s) gama(s) -- ej. ["Intel Core i5"] -> ["Intel Core i5", "AMD Ryzen 5",
-    "AMD Ryzen AI 5", ...] (todas las líneas "Media"). Preserva las líneas
-    originales aunque no tengan gama mapeada (no se pierde la intención del
-    usuario por una línea que no esté en el diccionario)."""
-    gamas = set()
+def gama_order() -> List[str]:
+    return _load().get("gama_order", [])
+
+
+def expand_to_group_and_above(lineas: List[str]) -> List[str]:
+    """Dada una línea (o lista de líneas), devuelve el grupo completo
+    cross-marca de su(s) gama(s) Y de TODAS las gamas de rendimiento por
+    encima -- ej. ["Intel Core i7"] (Alta) -> todas las líneas Alta Y
+    Premium de cualquier marca. "Esta gama o superior", no un valor exacto
+    ni solo equivalentes en la MISMA gama. Preserva las líneas originales
+    aunque no tengan gama mapeada (no se pierde la intención del usuario
+    por una línea que no esté en el diccionario).
+
+    Reporte real: pedir "notebook gama alta" (Intel Core i7/AMD Ryzen 7)
+    nunca ofrecía equipos con procesadores Premium (i9/Ryzen 9) aunque
+    superan el piso pedido -- mismo criterio que ya se usa para RAM/
+    almacenamiento con rangos {min,max} (ver _numeric_match en
+    cm_service.py): el piso de una gama es un mínimo, no un valor exacto."""
+    order = gama_order()
     result: List[str] = []
     for linea in lineas:
         if linea not in result:
             result.append(linea)
-        gama = get_gama(linea)
-        if gama:
-            gamas.add(gama)
-    for gama in gamas:
+    gamas = {g for g in (get_gama(linea) for linea in lineas) if g in order}
+    if not gamas:
+        return result
+    min_rank = min(order.index(g) for g in gamas)
+    for gama in order[min_rank:]:
         for linea in get_lineas_by_gama(gama):
             if linea not in result:
                 result.append(linea)
     return result
-
-
-def gama_order() -> List[str]:
-    return _load().get("gama_order", [])

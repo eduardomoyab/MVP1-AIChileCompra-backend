@@ -35,6 +35,7 @@ class AttributeSchema:
     label: str
     type: AttrType
     description: str = ""  # para el prompt del agente de extracción
+    help_text: str = ""  # para el comprador, en el wizard -- lenguaje simple, no el mismo texto que description (ver computadores_schema.py)
     core: bool = False  # bloquea el precio completo hasta estar lleno (ver price_service._RELAX_ORDER: tipo_equipo/total_ram_gb/total_almacenamiento_gb nunca se relajan -- son los "core" naturales de Computadores)
     optional_detail: bool = False  # aparece en el paso "detalles opcionales" del wizard, no en los pasos core
 
@@ -55,6 +56,8 @@ class AttributeSchema:
         quien arma la respuesta del endpoint -- acá solo va lo estático."""
         d = {"label": self.label, "type": self.type, "core": self.core,
              "optional_detail": self.optional_detail}
+        if self.help_text:
+            d["help_text"] = self.help_text
         if self.values_source == "fixed" and self.values:
             d["values"] = self.values
         if self.unit:
