@@ -61,6 +61,29 @@ def resolve_gama(texto: str) -> Optional[int]:
     return data.get("sinonimos_gama", {}).get(texto.strip().lower())
 
 
+def detect_gama(texto: str) -> Optional[int]:
+    """Como mentions_gama() pero devuelve el número de gama oficial
+    detectado (ej. "gama alta" -> 3) en vez de solo un booleano -- el
+    wizard lo usa para anotar, después de la extracción, que un
+    linea_procesador salió del PISO de una gama mencionada (no de un valor
+    textual exacto que el usuario haya tecleado), así el frontend puede
+    avisar que también califican procesadores superiores (ver
+    computadores_wizard_agent.py)."""
+    global _trigger_re
+    data = _load()
+    if _trigger_re is None:
+        palabras = sorted({
+            k for k in data.get("sinonimos_gama", {})
+            if not k.isdigit()
+        }, key=len, reverse=True)
+        pattern = r"\b(" + "|".join(re.escape(p) for p in palabras) + r")\b"
+        _trigger_re = re.compile(pattern, re.IGNORECASE)
+    m = _trigger_re.search(texto or "")
+    if not m:
+        return None
+    return data.get("sinonimos_gama", {}).get(m.group(1).lower())
+
+
 def mentions_gama(texto: str) -> bool:
     """Detección barata (una sola regex, sin LLM ni embeddings) de si un
     mensaje menciona una gama -- para decidir si vale la pena inyectar la
@@ -69,16 +92,7 @@ def mentions_gama(texto: str) -> bool:
     workstation/entrada/baja/avanzada/intermedia) -- los sinónimos puramente
     numéricos ("1","2","3","4") se excluyen a propósito: harían falso
     positivo con cualquier mención de cantidad ("necesito 2 laptops")."""
-    global _trigger_re
-    if _trigger_re is None:
-        data = _load()
-        palabras = sorted({
-            k for k in data.get("sinonimos_gama", {})
-            if not k.isdigit()
-        }, key=len, reverse=True)
-        pattern = r"\b(" + "|".join(re.escape(p) for p in palabras) + r")\b"
-        _trigger_re = re.compile(pattern, re.IGNORECASE)
-    return bool(_trigger_re.search(texto or ""))
+    return detect_gama(texto) is not None
 
 
 def format_gama_summary(gama: int) -> Optional[str]:

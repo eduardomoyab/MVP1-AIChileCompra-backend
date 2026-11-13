@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Tuple
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
+from agents import convenio_marco_gamas
 from agents.attribute_matcher import AttributeMatcher
 from agents.processor_family import extract_linea_procesador
 from agents.computadores_rules import (
@@ -252,6 +253,24 @@ class ComputadoresWizardAgent:
             })
             session["ficha"][attr] = normalized_value
             complement_updates.extend(self._apply_complements(session, attr, normalized_value))
+
+        # Reporte real: "la gama alta de notebook dice i7/Ryzen 7 o
+        # superior, pero el wizard solo muestra i7/Ryzen 7, como si tuviera
+        # techo" -- el PISO de una gama siempre se trata como mínimo (mismo
+        # criterio que ya aplica cm_service.py al buscar en el catálogo:
+        # ver gama_service.expand_to_group_and_above), pero la sugerencia
+        # de linea_procesador no lo comunicaba. Detección determinística
+        # (no delegada al LLM) de que el texto mencionó una gama, para
+        # anotar la actualización y que el frontend avise que los
+        # procesadores superiores también califican.
+        gama_detectada = convenio_marco_gamas.detect_gama(texto)
+        if gama_detectada:
+            for upd in ficha_updates:
+                if upd["attribute"] == "linea_procesador":
+                    upd["gama_note"] = (
+                        f"Corresponde al piso de Gama {gama_detectada} del Convenio Marco -- "
+                        "equipos con procesador de mayor rendimiento también califican en la búsqueda."
+                    )
 
         # Red de seguridad determinística -- ver infer_tipo_equipo_fallback.
         # Solo entra si el LLM no lo trajo en ESTE turno y la sesión todavía
