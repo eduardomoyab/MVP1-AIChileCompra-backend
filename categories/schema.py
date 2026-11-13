@@ -38,6 +38,12 @@ class AttributeSchema:
     help_text: str = ""  # para el comprador, en el wizard -- lenguaje simple, no el mismo texto que description (ver computadores_schema.py)
     core: bool = False  # bloquea el precio completo hasta estar lleno (ver price_service._RELAX_ORDER: tipo_equipo/total_ram_gb/total_almacenamiento_gb nunca se relajan -- son los "core" naturales de Computadores)
     optional_detail: bool = False  # aparece en el paso "detalles opcionales" del wizard, no en los pasos core
+    # Agrupa atributos optional_detail en acordeones en vez de una tabla
+    # plana (reporte real: "se ve muy verboso"). Opcional a propósito: si
+    # una categoría no agrupa NINGUNO de sus atributos opcionales, el
+    # wizard sigue mostrando la tabla plana de siempre -- no es obligación
+    # para categorías futuras (ver category_wizard.js::detallesScreenHtml).
+    group: str = ""
 
     # enum / enum_multi / dict: de dónde salen los valores válidos
     values_source: ValuesSource = "fixed"
@@ -58,6 +64,8 @@ class AttributeSchema:
              "optional_detail": self.optional_detail}
         if self.help_text:
             d["help_text"] = self.help_text
+        if self.group:
+            d["group"] = self.group
         if self.values_source == "fixed" and self.values:
             d["values"] = self.values
         if self.unit:
