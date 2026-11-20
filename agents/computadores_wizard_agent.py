@@ -73,6 +73,17 @@ load_dotenv()
 # (EXPLICIT_DECISION_RULE_TEXT) ya hace que ese valor explícito gane por
 # sobre el piso de la gama para ESE atributo -- el resto de la gama se
 # mantiene igual.
+# Reporte real: "laptop gama baja" solo llenaba tipo_equipo y respondía "la
+# gama baja no tiene especificaciones definidas". gama_section_text() manda
+# a tratarla "igual que 'oficina básico' en la tabla de uso más abajo", pero
+# esa tabla (min_specs_section_text) no está en este prompt a propósito
+# (ver arriba). Se le dan acá los mismos valores, sin inventar nada nuevo:
+# procesador del nivel "Básica" de BRAND_NEUTRALITY_TEXT (i3 / Ryzen 3) y
+# RAM/disco de "Trabajo de oficina básico" en min_specs_section_text().
+GAMA_BAJA_RULE_TEXT = """## GAMA BAJA / BÁSICA / ENTRADA (no es una gama oficial)
+
+El Convenio Marco no define una Gama 1. Si el usuario pide "gama baja", "básica" o "de entrada", NO dejes la ficha vacía: llénala con este piso estimado -- `linea_procesador`: ["Intel Core i3", "AMD Ryzen 3"], `total_ram_gb`: 8, `total_almacenamiento_gb`: 256. En el mensaje aclara en una oración que es una estimación para uso básico (por debajo de la Gama 2 oficial), no una gama del convenio. Igual que con cualquier gama, un valor explícito del usuario (ej. "gama baja con 16 GB") le gana a este piso para ese atributo."""
+
 USE_SUGGESTION_RULE_TEXT = """## PROPÓSITO DE USO MENCIONADO -- SOLO SUGERENCIA, NUNCA AUTOCOMPLETAR
 
 Si el usuario menciona un PROPÓSITO DE USO (ej. "para oficina", "para diseño gráfico", "para programar") SIN mencionar una gama del Convenio Marco, NO llenes el resto de los atributos a partir de eso -- esto no es una ficha de piso mínimo por uso, es una extracción literal de lo que el usuario escribió. Puedes mencionarlo como una sugerencia breve en el campo `message` (ej. "para oficina suele bastar con 8 GB de RAM y 256 GB de disco; puedes ajustarlo en los pasos siguientes"), pero esos valores NO van en `ficha_updates` salvo que el usuario además haya dado un número o especificación concreta, o haya mencionado una gama (ver RECONOCIMIENTO DE GAMA más abajo, que si se autocompleta)."""
@@ -104,6 +115,8 @@ Tu misión es, a partir de la descripción que el usuario escriba, extraer todos
 {TECHNICAL_DESCRIPTION_RULE_TEXT}
 
 {gama_section_text()}
+
+{GAMA_BAJA_RULE_TEXT}
 
 {USE_SUGGESTION_RULE_TEXT}
 
@@ -282,10 +295,16 @@ class ComputadoresWizardAgent:
         # procesadores superiores también califican.
         gama_detectada = convenio_marco_gamas.detect_gama(texto)
         if gama_detectada:
+            # Gama 1 ("baja"/"básica") no existe en el convenio -- ver
+            # GAMA_BAJA_RULE_TEXT; no citarla como si fuera oficial.
+            official = gama_detectada != 1
             for upd in ficha_updates:
                 if upd["attribute"] == "linea_procesador":
                     upd["gama_note"] = (
                         f"Corresponde al piso de Gama {gama_detectada} del Convenio Marco -- "
+                        "equipos con procesador de mayor rendimiento también califican en la búsqueda."
+                        if official else
+                        "Piso estimado para uso básico (el convenio no define una gama baja) -- "
                         "equipos con procesador de mayor rendimiento también califican en la búsqueda."
                     )
         elif _mentions_superior_qualifier(texto):
