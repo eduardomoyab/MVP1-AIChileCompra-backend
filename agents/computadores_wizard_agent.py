@@ -26,6 +26,7 @@ derivación de linea_procesador a partir de un modelo exacto
 
 import os
 import json
+import re
 import asyncio
 import contextlib
 import logging
@@ -126,6 +127,22 @@ Responde SIEMPRE con un único objeto JSON válido, nada más (sin texto antes n
 - **questions**: máximo UNA pregunta (lista vacía `[]` casi siempre).
 - Para numéricos: solo el número, sin unidad. Ej: 16, no "16 GB".
 - Para booleanos: true o false (sin comillas)."""
+
+
+# Reporte real: "pedí 'i7 o superior', detectó i7, pero no similares ni
+# superior" -- el usuario mencionó un procesador EXACTO (no la palabra
+# "gama"), calificado con "o superior/mejor/mayor". REGLA 0 hace bien en
+# respetar el valor explícito ("i7") sin agregar el equivalente de marca
+# ni expandir a toda la gama de rendimiento en el VALOR de la ficha (eso
+# dejaría la ficha/PDF final con una lista larga y poco legible) -- pero
+# igual hay que avisar que la BÚSQUEDA considera equivalentes/superiores,
+# mismo mecanismo que gama_detectada más abajo, solo que activado por esta
+# frase en vez de por la palabra "gama".
+_SUPERIOR_QUALIFIER_RE = re.compile(r"\bo\s+(superior(es)?|mejor(es)?|mayor(es)?|m[aá]s\b)", re.IGNORECASE)
+
+
+def _mentions_superior_qualifier(texto: str) -> bool:
+    return bool(_SUPERIOR_QUALIFIER_RE.search(texto or ""))
 
 
 # ─── Sesiones (independientes de las del chat legacy) ─────────────────────────
@@ -270,6 +287,13 @@ class ComputadoresWizardAgent:
                     upd["gama_note"] = (
                         f"Corresponde al piso de Gama {gama_detectada} del Convenio Marco -- "
                         "equipos con procesador de mayor rendimiento también califican en la búsqueda."
+                    )
+        elif _mentions_superior_qualifier(texto):
+            for upd in ficha_updates:
+                if upd["attribute"] == "linea_procesador":
+                    upd["gama_note"] = (
+                        "Es el piso de lo pedido -- equipos con procesador de rendimiento "
+                        "equivalente o superior (cualquier marca) también califican en la búsqueda."
                     )
 
         # Red de seguridad determinística -- ver infer_tipo_equipo_fallback.
