@@ -82,7 +82,7 @@ load_dotenv()
 # RAM/disco de "Trabajo de oficina básico" en min_specs_section_text().
 GAMA_BAJA_RULE_TEXT = """## GAMA BAJA / BÁSICA / ENTRADA (no es una gama oficial)
 
-El Convenio Marco no define una Gama 1. Si el usuario pide "gama baja", "básica" o "de entrada", NO dejes la ficha vacía: llénala con este piso estimado -- `linea_procesador`: ["Intel Core i3", "AMD Ryzen 3"], `total_ram_gb`: 8, `total_almacenamiento_gb`: 256. En el mensaje aclara en una oración que es una estimación para uso básico (por debajo de la Gama 2 oficial), no una gama del convenio. Igual que con cualquier gama, un valor explícito del usuario (ej. "gama baja con 16 GB") le gana a este piso para ese atributo."""
+El Convenio Marco no define una Gama 1 -- su mínimo es la Gama 2, y el Anexo A declara inadmisible cualquier oferta por debajo, así que en el catálogo de Convenio Marco NO hay equipos de este nivel. Si el usuario pide "gama baja", "básica" o "de entrada", NO dejes la ficha vacía: llénala con este piso estimado -- `linea_procesador`: ["Intel Core i3", "AMD Ryzen 3"], `total_ram_gb`: 8, `total_almacenamiento_gb`: 256. En el mensaje di explícitamente, en no más de dos oraciones, que (1) es una estimación para uso básico, no una gama del convenio, y (2) al estar bajo el mínimo del Convenio Marco (Gama 2) solo habrá opciones vía Compra Ágil. Igual que con cualquier gama, un valor explícito del usuario (ej. "gama baja con 16 GB") le gana a este piso para ese atributo."""
 
 USE_SUGGESTION_RULE_TEXT = """## PROPÓSITO DE USO MENCIONADO -- SOLO SUGERENCIA, NUNCA AUTOCOMPLETAR
 
@@ -304,8 +304,8 @@ class ComputadoresWizardAgent:
                         f"Corresponde al piso de Gama {gama_detectada} del Convenio Marco -- "
                         "equipos con procesador de mayor rendimiento también califican en la búsqueda."
                         if official else
-                        "Piso estimado para uso básico (el convenio no define una gama baja) -- "
-                        "equipos con procesador de mayor rendimiento también califican en la búsqueda."
+                        "Piso estimado para uso básico -- está bajo el mínimo del Convenio Marco "
+                        "(Gama 2), así que solo habrá opciones vía Compra Ágil."
                     )
         elif _mentions_superior_qualifier(texto):
             for upd in ficha_updates:
