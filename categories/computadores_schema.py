@@ -46,7 +46,7 @@ SCHEMA = CategorySchema(
         "linea_procesador": AttributeSchema(
             key="linea_procesador", label="Procesador (línea)", type="enum_multi",
             description='Familia del procesador sin número de modelo (ej. "Intel Core i5", "AMD Ryzen 7"). Admite varias opciones a la vez.',
-            help_text="El procesador es el componente que más influye en qué tan rápido responde el equipo. Entre más alto el número (i3 < i5 < i7 < i9, o Ryzen 3 < 5 < 7 < 9), mejor el rendimiento, pero también mayor el precio. Si no sabes cuál pedir, cuéntanos para qué se va a usar y te sugerimos uno.",
+            help_text="El procesador es el componente que más influye en qué tan rápido responde el equipo. Entre más alto el número (i3 < i5 < i7 < i9, o Ryzen 3 < 5 < 7 < 9), mejor el rendimiento, pero también mayor el precio. Si no sabes cuál pedir, vuelve a la descripción inicial y cuéntanos para qué se va a usar -- ahí te sugerimos uno (este paso no lee para qué lo necesitas, solo el valor del procesador).",
             values_source="dictionary",
             core=True,
         ),
